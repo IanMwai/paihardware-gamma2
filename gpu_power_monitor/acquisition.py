@@ -1,9 +1,12 @@
 """The acquisition loop behind `pai hardware`.
 
 Reads the DAQ (real or simulated), processes each block, logs it to CSV, and
-updates the live snapshot the dashboard reads. The loop is interruptible two
-ways: a ``stop_event`` (used when the dashboard runs it in a background thread)
-or KeyboardInterrupt (Ctrl+C in a foreground run).
+updates the live snapshot the dashboard reads. The loop is interruptible three
+ways: a ``stop_event`` (used when the dashboard runs it in a background thread),
+KeyboardInterrupt (Ctrl+C in a foreground run), or a ``STOP`` file appearing in
+the run folder (``pai stop <run>`` from any machine that can see output/, which
+is how gamma2 stops a run inside the VM). All three take the same clean exit
+path: NVML fetch, manifest finalize, checksums.
 """
 
 from __future__ import annotations
@@ -21,7 +24,11 @@ from .logging_writer import ChunkWriter
 from .manifest import create_manifest, finalize_manifest, update_manifest
 from .processing import PowerProcessor
 from .remote import NvmlLogger, remote_unready_reason
-from .utils import runs_root, unique_run_dir
+from .utils import runs_root, stop_file, unique_run_dir
+
+# How often the loop looks for a STOP file in the run folder. Cheap on local
+# disk; on a network share (gamma2 VM) it is one stat per interval.
+STOP_FILE_POLL_SEC = 0.5
 
 
 def with_measurement_name(config: AcquisitionConfig, name: str | None) -> AcquisitionConfig:
@@ -108,6 +115,8 @@ def acquire(
 
     start = time.time()
     failed = False
+    stop_marker = stop_file(run_dir)
+    next_stop_check = start
     source.start()
     try:
         while True:
@@ -115,6 +124,11 @@ def acquire(
                 break
             if duration_sec is not None and time.time() - start >= duration_sec:
                 break
+            if time.time() >= next_stop_check:
+                next_stop_check = time.time() + STOP_FILE_POLL_SEC
+                if stop_marker.exists():
+                    print_fn("[INFO] Stop requested (STOP file found) - finishing the run.")
+                    break
             available = source.available_samples()
             if available <= 0:
                 time.sleep(0.01)
@@ -149,6 +163,15 @@ def acquire(
             else:
                 print_fn(f"[WARN] NVML fetch failed: {result.get('error')}")
                 print_fn(f'[INFO] Retry later with: pai fetch "{run_dir.name}"')
+        # The STOP marker is a request, not data: drop it before the manifest
+        # inventories the folder (and so a later run of the same name is not
+        # stopped at birth).
+        try:
+            stop_marker.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print_fn(f"[WARN] Could not remove {stop_marker.name}: {exc}")
         if not failed:
             # On failure the manifest already says status=error and the live
             # state ERROR; finalizing here would overwrite both with "completed".

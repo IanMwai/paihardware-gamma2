@@ -1,0 +1,6 @@
+# /etc/udev/rules.d/99-ni-usb-vm.rules
+# Hand any National Instruments USB device (vendor 3923) to the QEMU user so
+# the daqwin VM can open it directly. Needed because the VM grabs the USB-6341
+# with QEMU's own vendor/product matching (see daqwin-qemu-commandline.xml),
+# which libvirt does not manage permissions for.
+SUBSYSTEM=="usb", ATTR{idVendor}=="3923", OWNER="libvirt-qemu", MODE="0660"

@@ -19,6 +19,9 @@ _ENV_OVERRIDES = {
     "PAI_GAMMA_USER": ("remote", "user"),
     "PAI_GAMMA_PASSWORD": ("remote", "password"),
     "PAI_GAMMA_KEY_PATH": ("remote", "key_path"),
+    # Who started the run (recorded in the manifest). The gamma2 wrapper sets
+    # this per run from the Linux username; `pai hardware --operator` overrides.
+    "PAI_OPERATOR": ("operator",),
 }
 
 
@@ -158,6 +161,9 @@ class AcquisitionConfig:
     # deletable at will (`pai runs delete`). Set per run with `pai hardware
     # --test` or the menu prompt, not via the config file.
     test_run: bool = False
+    # Who started the run; lands in the manifest. Set per run with `pai hardware
+    # --operator` or PAI_OPERATOR in the environment (empty = not recorded).
+    operator: str = ""
     channels: ChannelConfig = field(default_factory=ChannelConfig)
     scaling: ScalingConfig = field(default_factory=ScalingConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
@@ -177,7 +183,17 @@ def load_config(path: str | Path | None = None) -> AcquisitionConfig:
             raise FileNotFoundError(f"Config file not found: {path}")
         data = _load_mapping(path)
     _apply_env_overrides(data)
-    return config_from_mapping(data)
+    config = config_from_mapping(data)
+    # A relative output_root ("output") means "inside the project folder",
+    # whatever the current directory is. Absolute roots (e.g. a share mapped
+    # on the gamma2 VM via PAI_OUTPUT_ROOT) pass through untouched.
+    root = config.storage.output_root
+    if not root.is_absolute():
+        repo_root = Path(__file__).resolve().parent.parent
+        config = dataclasses.replace(
+            config, storage=dataclasses.replace(config.storage, output_root=repo_root / root)
+        )
+    return config
 
 
 def load_dotenv(path: str | Path | None = None) -> None:

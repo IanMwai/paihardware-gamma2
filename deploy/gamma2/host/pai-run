@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# pai-run - drive GPU power acquisition on gamma2 from gamma2.
+#
+# Acquisition runs headless inside the Windows VM (daqwin) that owns the NI
+# USB-6341; this wrapper starts it over SSH, serves the live dashboard from
+# gamma2, stops it via the STOP file on the shared output folder, and prints
+# where the run landed. Nobody needs to open the Windows desktop.
+#
+#   pai-run start NAME [--test] [--gpus LIST]   start a run (NAME: letters, digits, _ -)
+#   pai-run stop                                stop the current run cleanly
+#   pai-run status                              what is running, dashboard URL
+#   pai-run with NAME [--test] -- CMD...        start, run CMD on gamma2, stop
+#   pai-run dashboard [RUN|latest]              (re)open a dashboard on a run
+#
+# Config: /etc/pai-gamma2.conf (see pai-gamma2.conf.example), overridable by
+# ~/.config/pai-gamma2.conf. Requires: ssh key for the VM's daq user, the
+# host-side clone's venv (PAI_HOST_PAI), and PAI_OUTPUT_ROOT shared with the VM.
+set -euo pipefail
+
+# ---------------------------------------------------------------- config ---
+PAI_VM_NAME="${PAI_VM_NAME:-daqwin}"
+PAI_VM_USER="${PAI_VM_USER:-daq}"
+PAI_VM_HOST="${PAI_VM_HOST:-}"               # blank = ask libvirt for the VM's IP
+PAI_VM_PAI="${PAI_VM_PAI:-C:\pai\paihardware-gamma2\.venv\Scripts\pai.exe}"
+PAI_HOST_PAI="${PAI_HOST_PAI:-/opt/pai/paihardware-gamma2/.venv/bin/pai}"
+PAI_OUTPUT_ROOT="${PAI_OUTPUT_ROOT:-/srv/pai/output}"
+PAI_DASHBOARD_PORT="${PAI_DASHBOARD_PORT:-8000}"
+PAI_DASHBOARD_HOST="${PAI_DASHBOARD_HOST:-0.0.0.0}"
+PAI_START_TIMEOUT_SEC="${PAI_START_TIMEOUT_SEC:-60}"
+PAI_STOP_TIMEOUT_SEC="${PAI_STOP_TIMEOUT_SEC:-120}"
+for f in /etc/pai-gamma2.conf "$HOME/.config/pai-gamma2.conf"; do
+    # shellcheck disable=SC1090
+    [ -r "$f" ] && . "$f"
+done
+
+STATE_DIR="$PAI_OUTPUT_ROOT/.pai-run"      # shared: any user can see/stop the current run
+CURRENT="$STATE_DIR/current"               # run id of the run in progress
+OPERATOR="${PAI_OPERATOR:-${SUDO_USER:-$USER}}"
+
+log()  { printf '[pai-run] %s\n' "$*"; }
+die()  { printf '[pai-run] ERROR: %s\n' "$*" >&2; exit 1; }
+
+vm_host() {
+    if [ -n "$PAI_VM_HOST" ]; then echo "$PAI_VM_HOST"; return; fi
+    local ip
+    ip=$(virsh -c qemu:///system domifaddr "$PAI_VM_NAME" 2>/dev/null | awk '/ipv4/ {print $4}' | cut -d/ -f1 | head -1)
+    [ -n "$ip" ] || die "cannot find the IP of VM '$PAI_VM_NAME' (is it running? set PAI_VM_HOST to pin it)"
+    echo "$ip"
+}
+
+vm_ssh() {  # vm_ssh CMD... : run a command inside the Windows VM
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+        "$PAI_VM_USER@$(vm_host)" "$@"
+}
+
+manifest_field() {  # manifest_field RUN_DIR FIELD
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+from pathlib import Path
+try:
+    data = json.loads((Path(sys.argv[1]) / "manifest.json").read_text())
+except Exception:
+    sys.exit(0)
+value = data.get(sys.argv[2])
+print("" if value is None else value)
+PY
+}
+
+live_state() {  # live_state RUN_DIR -> LIVE/STALE/COMPLETE/ERROR/IDLE
+    python3 - "$1" <<'PY'
+import json, sys, time
+from pathlib import Path
+p = Path(sys.argv[1]) / "latest_status.json"
+try:
+    d = json.loads(p.read_text())
+except Exception:
+    print("IDLE"); sys.exit(0)
+state = d.get("state", "IDLE")
+if state == "LIVE" and time.time() - float(d.get("generated_at_epoch", 0)) > 5:
+    state = "STALE"
+print(state)
+PY
+}
+
+current_run() { [ -f "$CURRENT" ] && cat "$CURRENT" || true; }
+
+dashboard_url() {
+    local host
+    host=$(hostname -f 2>/dev/null || hostname)
+    echo "http://$host:$PAI_DASHBOARD_PORT/"
+}
+
+start_dashboard() {  # start_dashboard RUN_DIR
+    stop_dashboard
+    mkdir -p "$STATE_DIR"
+    PYTHONUNBUFFERED=1 setsid nohup "$PAI_HOST_PAI" dashboard "$1" --host "$PAI_DASHBOARD_HOST" \
+        --port "$PAI_DASHBOARD_PORT" --no-browser > "$STATE_DIR/dashboard.log" 2>&1 &
+    echo $! > "$STATE_DIR/dashboard.pid"
+}
+
+stop_dashboard() {
+    if [ -f "$STATE_DIR/dashboard.pid" ]; then
+        kill "$(cat "$STATE_DIR/dashboard.pid")" 2>/dev/null || true
+        rm -f "$STATE_DIR/dashboard.pid"
+    fi
+}
+
+cmd_start() {
+    local name="$1"; shift
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "NAME may only contain letters, digits, '_' and '-' (got: $name)"
+    local test_flag="" gpus=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --test) test_flag="--test";;
+            --gpus) gpus="$2"; shift;;
+            *) die "unknown option for start: $1";;
+        esac
+        shift
+    done
+    if [ -n "$(current_run)" ]; then
+        local cur; cur=$(current_run)
+        case "$(live_state "$(run_dir_of "$cur")")" in
+            LIVE) die "a run is already in progress: $cur  (pai-run stop first)";;
+            *) log "previous run '$cur' is no longer live; clearing its state"; rm -f "$CURRENT";;
+        esac
+    fi
+    local run_id="${name}_$(date +%Y%m%d_%H%M%S)"
+    local run_dir; run_dir=$(run_dir_of "$run_id" "$test_flag")
+    [ -e "$run_dir" ] && die "run folder already exists: $run_dir"
+
+    mkdir -p "$STATE_DIR"
+    local host; host=$(vm_host)
+    local args="hardware --run-id $run_id --operator $OPERATOR $test_flag"
+    [ -n "$gpus" ] && args="$args --gpus $gpus"
+    log "starting '$run_id' in VM $PAI_VM_NAME ($host) as $OPERATOR"
+    # Detached so the run survives this shell closing; stop with `pai-run stop`.
+    setsid nohup ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+        "$PAI_VM_USER@$host" "$PAI_VM_PAI $args" > "$STATE_DIR/$run_id.log" 2>&1 &
+    echo "$run_id" > "$CURRENT"
+
+    local waited=0
+    until [ -f "$run_dir/manifest.json" ]; do
+        sleep 1; waited=$((waited + 1))
+        if [ "$waited" -ge "$PAI_START_TIMEOUT_SEC" ]; then
+            rm -f "$CURRENT"
+            die "acquisition did not start within ${PAI_START_TIMEOUT_SEC}s - see $STATE_DIR/$run_id.log"
+        fi
+    done
+    start_dashboard "$run_dir"
+    log "running: $run_dir"
+    log "dashboard: $(dashboard_url)"
+}
+
+run_dir_of() {  # run_dir_of RUN_ID [--test]
+    if [ "${2:-}" = "--test" ]; then echo "$PAI_OUTPUT_ROOT/test/$1"
+    elif [ -d "$PAI_OUTPUT_ROOT/test/$1" ]; then echo "$PAI_OUTPUT_ROOT/test/$1"
+    else echo "$PAI_OUTPUT_ROOT/$1"; fi
+}
+
+cmd_stop() {
+    local run_id; run_id=$(current_run)
+    [ -n "$run_id" ] || die "no run in progress (nothing in $CURRENT)"
+    local run_dir; run_dir=$(run_dir_of "$run_id")
+    log "stopping '$run_id'"
+    "$PAI_HOST_PAI" stop "$run_dir" >/dev/null
+    local waited=0
+    until [ "$(manifest_field "$run_dir" status)" != "running" ]; do
+        sleep 1; waited=$((waited + 1))
+        [ "$waited" -ge "$PAI_STOP_TIMEOUT_SEC" ] && { log "WARNING: run still not finalized after ${PAI_STOP_TIMEOUT_SEC}s"; break; }
+    done
+    stop_dashboard
+    rm -f "$CURRENT"
+    log "status: $(manifest_field "$run_dir" status)   nvml: $(python3 -c "import json,sys;print((json.load(open(sys.argv[1])).get('nvml') or {}).get('status','skipped'))" "$run_dir/manifest.json" 2>/dev/null)"
+    log "run folder: $run_dir"
+    log "archive: $(manifest_field "$run_dir" archive_status)  (the sweep timer pushes ready runs; or: pai archive push \"$run_id\")"
+}
+
+cmd_status() {
+    local run_id; run_id=$(current_run)
+    if [ -z "$run_id" ]; then log "no run in progress"; return 0; fi
+    local run_dir; run_dir=$(run_dir_of "$run_id")
+    log "run:       $run_id"
+    log "state:     $(live_state "$run_dir")"
+    log "operator:  $(manifest_field "$run_dir" operator)"
+    log "folder:    $run_dir"
+    log "dashboard: $(dashboard_url)"
+}
+
+cmd_with() {
+    local name="$1"; shift
+    local start_args=()
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do start_args+=("$1"); shift; done
+    [ "${1:-}" = "--" ] || die "usage: pai-run with NAME [--test] -- CMD..."
+    shift
+    [ $# -gt 0 ] || die "no command given after --"
+    cmd_start "$name" "${start_args[@]}"
+    trap 'cmd_stop' EXIT INT TERM
+    log "running workload: $*"
+    "$@"
+}
+
+cmd_dashboard() {
+    local run="${1:-latest}" target
+    if [ "$run" = "latest" ]; then
+        target=latest                      # `pai dashboard latest` picks the newest run
+    else
+        target=$(run_dir_of "$run")
+        [ -d "$target" ] || die "no such run: $run"
+    fi
+    start_dashboard "$target"
+    sleep 1
+    if ! kill -0 "$(cat "$STATE_DIR/dashboard.pid")" 2>/dev/null; then
+        die "dashboard did not start - see $STATE_DIR/dashboard.log"
+    fi
+    log "$(grep -m1 'Dashboard for' "$STATE_DIR/dashboard.log" | sed 's/^\[INFO\] //')"
+    log "dashboard: $(dashboard_url)"
+}
+
+case "${1:-}" in
+    start)     shift; [ $# -ge 1 ] || die "usage: pai-run start NAME [--test] [--gpus LIST]"; cmd_start "$@";;
+    stop)      cmd_stop;;
+    status)    cmd_status;;
+    with)      shift; [ $# -ge 1 ] || die "usage: pai-run with NAME [--test] -- CMD..."; cmd_with "$@";;
+    dashboard) shift; cmd_dashboard "$@";;
+    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1;;
+esac

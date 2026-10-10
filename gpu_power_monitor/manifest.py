@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from .config import AcquisitionConfig
-from .utils import atomic_replace_text, utc_now_iso
+from .utils import STOP_FILE_NAME, atomic_replace_text, utc_now_iso
 
 
 MANIFEST_NAME = "manifest.json"
@@ -26,6 +26,9 @@ class RunManifest:
     # this field existed count as "archive".
     run_kind: str = "archive"
     archive_status: str = "local_only"
+    # Who started the run (Linux username on gamma2, Windows user, ...), when
+    # known. Informational; never used for permissions.
+    operator: str | None = None
     created_at: str = field(default_factory=utc_now_iso)
     started_at: str | None = None
     ended_at: str | None = None
@@ -45,6 +48,7 @@ def create_manifest(run_dir: Path, config: AcquisitionConfig) -> RunManifest:
         measurement_name=config.measurement_name,
         run_id=Path(run_dir).name,
         run_kind="test" if config.test_run else "archive",
+        operator=config.operator or None,
         started_at=utc_now_iso(),
         sample_rate_hz=float(config.sample_rate_hz),
         channels=asdict(config.channels),
@@ -108,7 +112,7 @@ def build_file_inventory(run_dir: Path) -> list[dict[str, Any]]:
         if not path.is_file():
             continue
         rel = path.relative_to(run_dir).as_posix()
-        if rel in {MANIFEST_NAME, "latest.npz", "latest_status.json"}:
+        if rel in {MANIFEST_NAME, "latest.npz", "latest_status.json", STOP_FILE_NAME}:
             continue
         files.append(
             {

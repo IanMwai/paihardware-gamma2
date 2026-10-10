@@ -1,0 +1,16 @@
+# /etc/systemd/system/pai-archive-sweep.service
+# Push every completed run that is waiting to be archived (ready_to_archive or
+# push_failed) to the cluster via Globus. Driven by pai-archive-sweep.timer.
+# Runs as the `pai` service user: that user owns the run folders, runs Globus
+# Connect Personal, and holds the Globus CLI login (`sudo -u pai globus login`).
+[Unit]
+Description=PAI: push runs waiting to be archived (Globus)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pai
+Group=pai
+WorkingDirectory=/opt/pai/paihardware-gamma2
+ExecStart=/opt/pai/paihardware-gamma2/.venv/bin/pai archive push-ready

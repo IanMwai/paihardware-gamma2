@@ -5,8 +5,10 @@ Two layers over the same underlying workflows:
 * Direct subcommands for the **developer** persona (scriptable, no prompts)::
 
       pai hardware [--simulate] [--test]  # start acquisition (headless by default)
-      pai dashboard <run> [--replay]      # open a dashboard on a run
+      pai stop <run>                      # ask a running acquisition to stop cleanly
+      pai dashboard <run|latest> [--host 0.0.0.0]  # dashboard on a run (or the newest)
       pai archive push|copy|verify|status|cleanup|mark-archived <run>
+      pai archive push-ready              # push every run waiting to be archived
       pai runs list|promote|demote|delete [run]  # test runs vs archive-bound runs
       pai fetch <run>                     # retry pulling NVML files from gamma
 
@@ -42,7 +44,20 @@ def _default_config() -> Path:
 
 
 def _output_root() -> Path:
-    return _repo_root() / "output"
+    """Where runs live: ``storage.output_root`` from the config.
+
+    ``PAI_OUTPUT_ROOT`` in ``.env`` overrides it (on the gamma2 VM that is the
+    share served by gamma2), and a relative value means "inside the project
+    folder". Every listing/lookup goes through here so `pai runs`, `pai
+    archive`, `pai fetch` and auto-naming all see the same folder acquisition
+    writes to.
+    """
+    from gpu_power_monitor.config import load_config
+
+    try:
+        return Path(load_config(_default_config()).storage.output_root)
+    except Exception:  # unreadable config: fall back to the historical default
+        return _repo_root() / "output"
 
 
 def _list_runs() -> list[Path]:
@@ -52,10 +67,15 @@ def _list_runs() -> list[Path]:
     root = _output_root()
     if not root.exists():
         return []
-    runs = [p for p in root.iterdir() if p.is_dir() and p.name != TEST_RUNS_SUBDIR]
+    # Dot-folders are tooling state (gamma2's pai-run keeps its own under
+    # output/.pai-run), never runs.
+    runs = [
+        p for p in root.iterdir()
+        if p.is_dir() and p.name != TEST_RUNS_SUBDIR and not p.name.startswith(".")
+    ]
     test_root = root / TEST_RUNS_SUBDIR
     if test_root.is_dir():
-        runs += [p for p in test_root.iterdir() if p.is_dir()]
+        runs += [p for p in test_root.iterdir() if p.is_dir() and not p.name.startswith(".")]
     return sorted(runs, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -73,6 +93,10 @@ def _resolve_run(run: str | Path) -> Path:
     """
     from gpu_power_monitor.utils import TEST_RUNS_SUBDIR
 
+    if str(run).strip().lower() == "latest":
+        latest = _latest_run()
+        if latest is not None:
+            return latest
     path = Path(run)
     if path.is_dir():
         return path
@@ -105,11 +129,15 @@ def run_dashboard(
     port: int = 8000,
     open_browser: bool = True,
     config_path: Path | None = None,
+    host: str = "127.0.0.1",
 ) -> int:
     from gpu_power_monitor.config import load_config
     from gpu_power_monitor.web import serve
 
     run_dir = _resolve_run(run_dir)
+    if not run_dir.is_dir():
+        print(f"[ERROR] No such run: {run_dir}")
+        return 1
     config = load_config(config_path or _default_config())
     display = {
         "window_sec": config.display.window_sec,
@@ -119,7 +147,7 @@ def run_dashboard(
         "fullscreen": fullscreen or config.display.fullscreen,
         "replay": replay,
     }
-    serve(run_dir, display=display, port=port, open_browser=open_browser)
+    serve(run_dir, display=display, host=host, port=port, open_browser=open_browser)
     return 0
 
 
@@ -187,6 +215,72 @@ def run_archive(command: str, run_dir: Path, **kwargs) -> int:
             print("[INFO] Local run is cleanup-eligible. Re-run with --delete to remove it.")
         else:
             print("[INFO] Local run is not cleanup-eligible.")
+    return 0
+
+
+def run_push_ready(*, config_path: Path | None = None) -> int:
+    """`pai archive push-ready` - submit every run that is waiting to be archived.
+
+    Meant for an unattended sweep (the gamma2 archive timer): runs whose
+    manifest says ``ready_to_archive`` or ``push_failed`` are pushed, everything
+    else is left alone. Exit code is non-zero only if a push was attempted and
+    failed, so a quiet sweep with nothing to do is a success.
+    """
+    from gpu_power_monitor import globus_push
+    from gpu_power_monitor.config import load_config
+    from gpu_power_monitor.manifest import load_manifest
+
+    config = load_config(config_path or _default_config())
+    gcfg = config.storage.globus
+    waiting = []
+    for run in _list_runs():
+        try:
+            data = load_manifest(run)
+        except (FileNotFoundError, ValueError, OSError):
+            continue
+        if data.get("status") != "completed" or data.get("run_kind", "archive") == "test":
+            continue
+        if data.get("archive_status") in ("ready_to_archive", "push_failed"):
+            waiting.append(run)
+    if not waiting:
+        print("[INFO] No runs waiting to be archived.")
+        return 0
+    reason = globus_push.globus_unready_reason(gcfg)
+    if reason:
+        print(f"[ERROR] Cannot push: {reason}")
+        return 1
+    failures = 0
+    for run in waiting:
+        try:
+            task_id = globus_push.push_run(run, gcfg, config.storage.archive_root)
+        except Exception as exc:
+            failures += 1
+            print(f"[WARN] {run.name}: push failed: {exc}")
+            continue
+        print(f"[INFO] {run.name}: transfer submitted (Globus task {task_id}).")
+    return 1 if failures else 0
+
+
+def run_stop(run: str | Path) -> int:
+    """`pai stop <run>` - ask the acquisition writing this run to stop cleanly.
+
+    Works from any machine that can see the run folder (the acquisition polls
+    for the marker), which is how gamma2 stops a run inside the VM.
+    """
+    from gpu_power_monitor.live_buffer import read_live_status
+    from gpu_power_monitor.utils import request_stop
+
+    run_dir = _resolve_run(run)
+    if not run_dir.is_dir():
+        print(f"[ERROR] No such run: {run}")
+        return 1
+    state = read_live_status(run_dir, stale_after_sec=5.0).state
+    if state in ("COMPLETE", "ERROR"):
+        print(f"[INFO] '{run_dir.name}' is not running (state {state}) - nothing to stop.")
+        return 0
+    request_stop(run_dir)
+    print(f"[INFO] Stop requested for '{run_dir.name}'. The run finalizes within a few seconds; "
+          f'check with: pai runs list')
     return 0
 
 
@@ -350,17 +444,22 @@ def run_hardware(
     port: int = 8000,
     config_path: Path | None = None,
     duration_sec: float | None = None,
+    run_id: str | None = None,
+    operator: str | None = None,
 ) -> int:
     import dataclasses
     import threading
 
     from gpu_power_monitor.acquisition import acquire, with_measurement_name
     from gpu_power_monitor.config import load_config, select_gpus
-    from gpu_power_monitor.utils import runs_root, unique_run_dir
+    from gpu_power_monitor.utils import runs_root, sanitize_folder_name, unique_run_dir
 
     config = with_measurement_name(
-        load_config(config_path or _default_config()), name or auto_run_name(test=test)
+        load_config(config_path or _default_config()),
+        name or (run_id if run_id else auto_run_name(test=test)),
     )
+    if operator:
+        config = dataclasses.replace(config, operator=operator)
     try:
         config = select_gpus(config, gpus)
     except ValueError as exc:
@@ -371,16 +470,32 @@ def run_hardware(
     if test:
         config = dataclasses.replace(config, test_run=True)
 
+    # --run-id: the caller picks the exact folder name (no timestamp appended),
+    # so a controller on another machine (gamma2's pai-run) knows the run path
+    # before acquisition starts. Refused if the folder already exists.
+    explicit_dir: Path | None = None
+    if run_id:
+        if sanitize_folder_name(run_id) != run_id.strip():
+            print(f"[ERROR] --run-id contains characters not allowed in a folder name: {run_id!r}")
+            return 1
+        explicit_dir = runs_root(config.storage.output_root, test=test) / run_id.strip()
+        if explicit_dir.exists():
+            print(f"[ERROR] Run folder already exists: {explicit_dir}")
+            return 1
+
     if not display:
-        # Headless (developer): acquisition in the foreground, Ctrl+C to stop.
-        run_dir = acquire(config, simulate=simulate, duration_sec=duration_sec)
+        # Headless (developer): acquisition in the foreground, Ctrl+C to stop
+        # (or `pai stop <run>` from any machine that sees the run folder).
+        run_dir = acquire(config, simulate=simulate, duration_sec=duration_sec, run_dir=explicit_dir)
         _auto_push(run_dir, config)
         return 0
 
     # Demo: acquisition in a background thread, dashboard in the foreground.
     from gpu_power_monitor.web import serve
 
-    run_dir = unique_run_dir(runs_root(config.storage.output_root, test=test), config.measurement_name)
+    run_dir = explicit_dir or unique_run_dir(
+        runs_root(config.storage.output_root, test=test), config.measurement_name
+    )
     stop = threading.Event()
 
     def _background_acquire() -> None:
@@ -717,18 +832,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_hw.add_argument("--port", type=int, default=8000, help="Dashboard port (with --display).")
     p_hw.add_argument("--config", help="Config YAML (default: configs/default.yaml).")
     p_hw.add_argument("--duration-sec", type=float, help="Optional finite duration for smoke tests.")
+    p_hw.add_argument(
+        "--run-id",
+        help="Exact run folder name to create (no timestamp appended); refused if it exists. "
+        "Lets a controller on another machine know the run path up front.",
+    )
+    p_hw.add_argument(
+        "--operator",
+        help="Who is starting this run; recorded in the manifest (default: PAI_OPERATOR env).",
+    )
+
+    p_stop = sub.add_parser("stop", help="Ask a running acquisition to stop cleanly.")
+    p_stop.add_argument("run", help="Run directory or name under output/ (or 'latest').")
 
     p_dash = sub.add_parser("dashboard", help="Open a dashboard on a run.")
-    p_dash.add_argument("run", help="Run directory under output/.")
+    p_dash.add_argument("run", help="Run directory under output/, or 'latest' for the newest run.")
     p_dash.add_argument("--replay", action="store_true", help="Force replay of saved CSVs.")
     p_dash.add_argument("--fullscreen", action="store_true", help="Video-wall fullscreen.")
+    p_dash.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Address to serve on (default: this machine only; 0.0.0.0 = reachable from the network).",
+    )
     p_dash.add_argument("--port", type=int, default=8000, help="Web dashboard port.")
     p_dash.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser.")
     p_dash.add_argument("--config", help="Config YAML (default: configs/default.yaml).")
 
     p_arch = sub.add_parser("archive", help="Archive or inspect a completed run.")
-    p_arch.add_argument("action", choices=["push", "copy", "verify", "status", "cleanup", "mark-archived"])
-    p_arch.add_argument("run", help="Run directory under output/.")
+    p_arch.add_argument(
+        "action",
+        choices=["push", "push-ready", "copy", "verify", "status", "cleanup", "mark-archived"],
+    )
+    p_arch.add_argument("run", nargs="?", help="Run directory under output/ (not needed for push-ready).")
     p_arch.add_argument("--archived-run-dir")
     p_arch.add_argument("--delete", action="store_true")
     p_arch.add_argument("--config", help="Config YAML (default: configs/default.yaml).")
@@ -769,7 +904,11 @@ def main(argv: list[str] | None = None) -> int:
             port=args.port,
             config_path=Path(args.config) if args.config else None,
             duration_sec=args.duration_sec,
+            run_id=args.run_id,
+            operator=args.operator,
         )
+    if args.command == "stop":
+        return run_stop(args.run)
     if args.command == "dashboard":
         return run_dashboard(
             Path(args.run),
@@ -778,8 +917,13 @@ def main(argv: list[str] | None = None) -> int:
             port=args.port,
             open_browser=not args.no_browser,
             config_path=Path(args.config) if args.config else None,
+            host=args.host,
         )
     if args.command == "archive":
+        if args.action == "push-ready":
+            return run_push_ready(config_path=Path(args.config) if args.config else None)
+        if not args.run:
+            parser.error("archive: a run is required for this action")
         return run_archive(
             args.action,
             Path(args.run),

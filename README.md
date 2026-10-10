@@ -1,20 +1,35 @@
-# PAI Hardware — GPU Power Monitor
+# PAI Hardware — GPU Power Monitor (gamma2)
 
 High-rate GPU power measurement for the PAI hardware initiative (Le Xie lab and
 Minlan Yu lab). The system logs 10 kHz NI-DAQ voltage/current for **four GPUs
 independently** on the DAQ machine, records GPU-side NVML telemetry on the
-workload machine ("gamma") over SSH for the same window, serves a live browser
+workload machine over SSH for the same window, serves a live browser
 dashboard, and archives completed runs to shared cluster storage automatically
 via Globus. The long-term goal is a rich public dataset of high-resolution GPU
 power data.
 
+**This is the gamma2 variant** of [paihardware](https://github.com/IanMwai/paihardware)
+(the 3.102 / gamma deployment, which stays untouched). On gamma2 the DAQ
+machine is a Windows VM running *on* the GPU server, and every measurement is
+started, watched and archived from the server's Linux shell. The acquisition
+code is the same; this repo adds the controls that make remote driving
+possible and the deployment files for the VM. **Start with
+[`deploy/gamma2/README.md`](deploy/gamma2/README.md)** for setup and daily use
+on gamma2; the rest of this document describes the `pai` tool itself and still
+applies.
+
 ## Deployment context and assumptions
 
-- **Primary deployment:** the left Windows computer in lab **3.102**, which is
-  wired to the NI-DAQ box measuring the GPU power rails. The software is not
-  tied to that machine and can run on any similar Windows setup with the
-  NI-DAQmx driver and NI-DAQ hardware. The only machine-specific state is the
-  `.env` file and the DAQ device name (see setup below).
+- **Primary deployment:** the `daqwin` Windows 11 VM on **gamma2**, with the
+  NI USB-6341 passed through from the host (NI's Linux driver does not support
+  USB DAQs, which is why the VM exists). The software is not tied to that VM
+  and runs on any Windows setup with the NI-DAQmx driver and NI-DAQ hardware.
+  The only machine-specific state is the `.env` file and the DAQ device name
+  (see setup below).
+- **Driven from gamma2:** `pai-run start|stop|with` on the host starts
+  acquisition in the VM over SSH, serves the dashboard on gamma2, and stops a
+  run by dropping a `STOP` file into the run folder, which lives on gamma2's
+  disk (shared to the VM). Nobody opens the Windows desktop for a measurement.
 - **Archiving assumes Harvard FASRC:** the default destination is the Le Xie
   lab's holylabs path via the FASRC Globus collection. Another lab (e.g.
   Minlan's) points `PAI_ARCHIVE_ROOT` (and, if needed,
@@ -56,8 +71,8 @@ Instruments; reboot after installing) and **Python 3.10+** on PATH.
 In PowerShell:
 
 ```powershell
-git clone https://github.com/IanMwai/paihardware.git
-cd paihardware
+git clone https://github.com/IanMwai/paihardware-gamma2.git
+cd paihardware-gamma2
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .[hardware,archive,remote]
@@ -74,7 +89,7 @@ plain `pip install -e .` is enough. If `pai` is ever not on PATH, every
 > auto-activation snippet to your PowerShell profile, e.g.
 > ```powershell
 > # in $PROFILE (adjust the path to where you cloned the project):
-> $pai = "$HOME\Desktop\paihardware"
+> $pai = "$HOME\Desktop\paihardware-gamma2"
 > if ($PWD.Path -like "$pai*" -and (Test-Path "$pai\.venv\Scripts\Activate.ps1")) {
 >     & "$pai\.venv\Scripts\Activate.ps1"
 > }
@@ -108,7 +123,7 @@ notes that NVML logging was skipped.
 ### Per-user setup on a shared machine
 
 Each Windows profile keeps its **own clone** (e.g.
-`C:\Users\<netid>\Desktop\paihardware`) with its own venv, `.env`, and
+`C:\Users\<netid>\Desktop\paihardware-gamma2`) with its own venv, `.env`, and
 `output/` folder. No file in the repo contains an absolute path, so nothing
 needs editing when you clone to a different location: the config, output
 directory, and dashboard all resolve relative to your clone. Per-user
@@ -203,7 +218,22 @@ pai hardware --test --simulate
 ```
 
 Runs are written under `output/<measurement_name>_<timestamp>/`. Press `Ctrl+C`
-to stop a run cleanly.
+to stop a run cleanly, or from any machine that can see the run folder:
+
+```bash
+pai stop "<run_id>"        # or: pai stop latest
+```
+
+This drops a `STOP` marker into the run folder; the acquisition loop polls for
+it (every 0.5 s) and takes the same clean exit path as `Ctrl+C` (NVML fetch,
+manifest, checksums), then removes the marker. It is how gamma2 stops a run
+inside the VM.
+
+Two flags exist for controllers on another machine (gamma2's `pai-run` uses
+both): `--run-id NAME` creates exactly `output/NAME/` (no timestamp appended;
+refused if it exists), so the caller knows the run path before acquisition
+starts; `--operator WHO` records who started the run in the manifest
+(`PAI_OPERATOR` in the environment is the default).
 
 ## View dashboard
 
@@ -212,7 +242,11 @@ streams from the live snapshot files the acquisition writes and opens in a brows
 
 ```bash
 pai dashboard output/<run_id>
+pai dashboard latest                 # the newest run
+pai dashboard latest --host 0.0.0.0  # reachable from other machines (gamma2 serves it this way)
 ```
+
+By default the server listens on this machine only (`127.0.0.1`).
 
 For a video wall, open the browser fullscreen (or pass `--fullscreen`). Useful
 flags: `--port <n>` and `--no-browser`.
@@ -401,7 +435,12 @@ and on `pai archive status <run>`. Manual submit/retry:
 ```bash
 pai archive push output/<run_id>
 pai archive status output/<run_id>
+pai archive push-ready               # push every run that is ready_to_archive / push_failed
 ```
+
+`push-ready` is the unattended form (gamma2 runs it from a systemd timer):
+runs already pending, archived, in progress, or marked test are left alone,
+and a sweep with nothing to do exits 0.
 
 **Duplicates are not possible.** Already-archived runs are refused with "Run
 is already archived" (menu option 5 likewise reports rather than resubmits a
@@ -525,7 +564,8 @@ change them unless the wiring changes:
 
 ## Staying up to date, and contributing
 
-The repo lives at <https://github.com/IanMwai/paihardware>. It is a
+The repo lives at <https://github.com/IanMwai/paihardware-gamma2> (the
+3.102 deployment is <https://github.com/IanMwai/paihardware>). It is a
 **personal repo** (maintained by Ian Toyota): lab members do not have write
 access; use it, pull updates, and contribute via fork + pull request. If you
 hit an issue, email Ian, ping him on the lab Slack, or open a GitHub issue on
@@ -548,16 +588,16 @@ because they are not tracked by git.
 
 **Contributing** : fork + PR.
 
-1. Click **Fork** on <https://github.com/IanMwai/paihardware>.
+1. Click **Fork** on <https://github.com/IanMwai/paihardware-gamma2>.
 2. Clone *your fork*, and add this repo as `upstream`:
 
    ```bash
-   git remote add upstream https://github.com/IanMwai/paihardware.git
+   git remote add upstream https://github.com/IanMwai/paihardware-gamma2.git
    ```
 
 3. Branch, make your change, and run the tests (`python -m pytest tests`;
    they pass without DAQ hardware or Globus).
-4. Push to your fork and open a pull request against `IanMwai/paihardware`.
+4. Push to your fork and open a pull request against `IanMwai/paihardware-gamma2`.
    Keep your fork in sync with `git fetch upstream && git merge upstream/main`.
 
 ## Ground rules

@@ -24,6 +24,22 @@ def utc_now_iso() -> str:
 # The manifest's run_kind stays the source of truth; the folder is derived.
 TEST_RUNS_SUBDIR = "test"
 
+# Dropping a file with this name into a run folder asks a running acquisition
+# to stop cleanly (same exit path as Ctrl+C: NVML fetch, manifest, checksums).
+# With output/ on a share this is how gamma2 stops a run inside the VM.
+STOP_FILE_NAME = "STOP"
+
+
+def stop_file(run_dir: Path) -> Path:
+    return Path(run_dir) / STOP_FILE_NAME
+
+
+def request_stop(run_dir: Path) -> Path:
+    """Ask the acquisition writing ``run_dir`` to stop; returns the marker path."""
+    path = stop_file(run_dir)
+    path.touch()
+    return path
+
 
 def runs_root(output_root: Path, *, test: bool) -> Path:
     """Where runs of this kind live: ``<output_root>`` or ``<output_root>/test``."""
