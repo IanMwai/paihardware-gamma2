@@ -149,7 +149,7 @@ def test_dot_folders_are_not_runs(tmp_path, monkeypatch):
     run.mkdir()
     save_manifest(run, {"measurement_name": run.name, "run_id": run.name, "status": "completed"})
     time.sleep(0.05)
-    (tmp_path / ".pai-run").mkdir()          # newer than the run, but tooling state
+    (tmp_path / ".pai").mkdir()              # newer than the run, but tooling state
     (tmp_path / "test" / ".cache").mkdir(parents=True)
     assert [r.name for r in cli._list_runs()] == [run.name]
     assert cli._resolve_run("latest") == run

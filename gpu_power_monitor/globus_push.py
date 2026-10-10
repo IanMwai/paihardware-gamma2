@@ -75,8 +75,8 @@ def globus_unready_reason(cfg: GlobusConfig) -> str | None:
     """Why a push cannot be attempted, or None if it can."""
     if not cfg.local_endpoint_id or not cfg.remote_endpoint_id:
         return (
-            "Globus endpoint IDs are not configured - set storage.globus."
-            "local_endpoint_id and remote_endpoint_id in configs/default.yaml"
+            "Globus endpoint IDs are not configured - set PAI_GLOBUS_LOCAL_ENDPOINT_ID "
+            "(this machine's Globus Connect Personal endpoint) in .env"
         )
     if shutil.which("globus") is None:
         return "globus-cli is not installed - run: pip install globus-cli"

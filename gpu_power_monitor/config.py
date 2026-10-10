@@ -22,6 +22,14 @@ _ENV_OVERRIDES = {
     # Who started the run (recorded in the manifest). The gamma2 wrapper sets
     # this per run from the Linux username; `pai hardware --operator` overrides.
     "PAI_OPERATOR": ("operator",),
+    # gamma2: acquisition runs inside a Windows VM on this host. With these set,
+    # `pai hardware` starts the run there over SSH instead of locally.
+    "PAI_VM_NAME": ("vm", "name"),
+    "PAI_VM_HOST": ("vm", "host"),
+    "PAI_VM_USER": ("vm", "user"),
+    "PAI_VM_PAI": ("vm", "pai"),
+    # Where dashboards listen (0.0.0.0 = reachable from the lab network).
+    "PAI_DASHBOARD_HOST": ("display", "host"),
 }
 
 
@@ -96,6 +104,32 @@ class DisplayConfig:
     )
     stale_after_sec: float = 2.0
     fullscreen: bool = False
+    # Address the dashboard server binds. 127.0.0.1 = this machine only (the
+    # lab PC); gamma2 sets PAI_DASHBOARD_HOST=0.0.0.0 so laptops can open it.
+    host: str = "127.0.0.1"
+
+
+@dataclass(frozen=True)
+class VmConfig:
+    """Acquisition machine when it is a VM on this host (gamma2).
+
+    Unset (the default) means the DAQ is on this machine and `pai hardware`
+    acquires locally. With user + pai set and a host (or a libvirt name to look
+    the host up from), `pai hardware` starts the same `pai hardware` inside the
+    VM over SSH, with --run-id so the run folder is known up front, and this
+    side serves the dashboard, stops the run via the STOP file, and archives.
+    The run folder must be shared between the two (PAI_OUTPUT_ROOT on both).
+    """
+
+    name: str = ""       # libvirt domain name, used to look up the IP if host is blank
+    host: str = ""       # IP or hostname of the VM
+    user: str = ""       # Windows account with the SSH key authorised
+    pai: str = ""        # path of pai.exe inside the VM
+    start_timeout_sec: float = 60.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.user and self.pai and (self.host or self.name))
 
 
 @dataclass(frozen=True)
@@ -171,6 +205,7 @@ class AcquisitionConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     remote: RemoteConfig = field(default_factory=RemoteConfig)
+    vm: VmConfig = field(default_factory=VmConfig)
 
 
 def load_config(path: str | Path | None = None) -> AcquisitionConfig:
@@ -267,6 +302,7 @@ def config_from_mapping(data: dict[str, Any]) -> AcquisitionConfig:
     if "enabled" in remote_data:
         remote_data["enabled"] = _as_bool(remote_data["enabled"])
     remote = RemoteConfig(**remote_data)
+    vm = VmConfig(**_section(data, "vm"))
 
     top = {
         key: value
@@ -280,6 +316,7 @@ def config_from_mapping(data: dict[str, Any]) -> AcquisitionConfig:
             "storage",
             "logging",
             "remote",
+            "vm",
         }
     }
     return AcquisitionConfig(
@@ -291,6 +328,7 @@ def config_from_mapping(data: dict[str, Any]) -> AcquisitionConfig:
         storage=storage,
         logging=logging,
         remote=remote,
+        vm=vm,
     )
 
 

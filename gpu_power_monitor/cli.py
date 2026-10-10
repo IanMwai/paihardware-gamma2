@@ -4,9 +4,9 @@ Two layers over the same underlying workflows:
 
 * Direct subcommands for the **developer** persona (scriptable, no prompts)::
 
-      pai hardware [--simulate] [--test]  # start acquisition (headless by default)
-      pai stop <run>                      # ask a running acquisition to stop cleanly
-      pai dashboard <run|latest> [--host 0.0.0.0]  # dashboard on a run (or the newest)
+      pai hardware [--simulate] [--test] [-- CMD...]  # start acquisition (headless by default)
+      pai stop <run|latest>               # ask a running acquisition to stop cleanly
+      pai dashboard <run|latest>          # dashboard on a run (or the newest)
       pai archive push|copy|verify|status|cleanup|mark-archived <run>
       pai archive push-ready              # push every run waiting to be archived
       pai runs list|promote|demote|delete [run]  # test runs vs archive-bound runs
@@ -14,6 +14,10 @@ Two layers over the same underlying workflows:
 
 * An interactive **menu** for the lab-demo persona, shown when `pai` is run with
   no arguments. It favors fast uptime and quick live/replay viewing.
+
+Where the DAQ is attached to another machine (gamma2: a Windows VM on the
+host, see `vm.py`), `pai hardware` starts the run there over SSH and this side
+serves the dashboard, stops the run and archives it. Same commands, same menu.
 """
 
 from __future__ import annotations
@@ -67,8 +71,8 @@ def _list_runs() -> list[Path]:
     root = _output_root()
     if not root.exists():
         return []
-    # Dot-folders are tooling state (gamma2's pai-run keeps its own under
-    # output/.pai-run), never runs.
+    # Dot-folders are tooling state (the gamma2 host keeps VM launch logs under
+    # output/.pai), never runs.
     runs = [
         p for p in root.iterdir()
         if p.is_dir() and p.name != TEST_RUNS_SUBDIR and not p.name.startswith(".")
@@ -129,7 +133,7 @@ def run_dashboard(
     port: int = 8000,
     open_browser: bool = True,
     config_path: Path | None = None,
-    host: str = "127.0.0.1",
+    host: str | None = None,
 ) -> int:
     from gpu_power_monitor.config import load_config
     from gpu_power_monitor.web import serve
@@ -139,6 +143,9 @@ def run_dashboard(
         print(f"[ERROR] No such run: {run_dir}")
         return 1
     config = load_config(config_path or _default_config())
+    host = host or config.display.host
+    if config.vm.enabled:
+        open_browser = False  # the host is headless; people open the printed URL
     display = {
         "window_sec": config.display.window_sec,
         "refresh_ms": config.display.refresh_ms,
@@ -403,8 +410,21 @@ def run_runs(action: str, run: str | None) -> int:
     return 0
 
 
-def run_devices() -> int:
+def run_devices(config_path: Path | None = None) -> int:
     """List connected NI-DAQ devices so the user can confirm the device name."""
+    from gpu_power_monitor.config import load_config
+
+    config = load_config(config_path or _default_config())
+    if config.vm.enabled:
+        from gpu_power_monitor import vm
+
+        try:
+            proc = vm.run_pai(config.vm, ["devices"])
+        except vm.VmUnavailable as exc:
+            print(f"[ERROR] {exc}")
+            return 1
+        print((proc.stdout or proc.stderr).rstrip())
+        return proc.returncode
     try:
         import nidaqmx.system
     except ImportError:
@@ -446,6 +466,7 @@ def run_hardware(
     duration_sec: float | None = None,
     run_id: str | None = None,
     operator: str | None = None,
+    workload: list[str] | None = None,
 ) -> int:
     import dataclasses
     import threading
@@ -460,6 +481,13 @@ def run_hardware(
     )
     if operator:
         config = dataclasses.replace(config, operator=operator)
+    elif not config.operator:
+        import getpass
+
+        try:
+            config = dataclasses.replace(config, operator=getpass.getuser())
+        except Exception:
+            pass
     try:
         config = select_gpus(config, gpus)
     except ValueError as exc:
@@ -471,7 +499,7 @@ def run_hardware(
         config = dataclasses.replace(config, test_run=True)
 
     # --run-id: the caller picks the exact folder name (no timestamp appended),
-    # so a controller on another machine (gamma2's pai-run) knows the run path
+    # so a controller on another machine (the gamma2 host) knows the run path
     # before acquisition starts. Refused if the folder already exists.
     explicit_dir: Path | None = None
     if run_id:
@@ -483,14 +511,22 @@ def run_hardware(
             print(f"[ERROR] Run folder already exists: {explicit_dir}")
             return 1
 
-    if not display:
+    if config.vm.enabled and not simulate:
+        # gamma2: the DAQ is in the VM. Same run, started over there.
+        return _run_hardware_in_vm(
+            config, display=display, test=test, gpus=gpus, port=port,
+            run_id=run_id, explicit_dir=explicit_dir, workload=workload,
+        )
+
+    if not display and not workload:
         # Headless (developer): acquisition in the foreground, Ctrl+C to stop
         # (or `pai stop <run>` from any machine that sees the run folder).
         run_dir = acquire(config, simulate=simulate, duration_sec=duration_sec, run_dir=explicit_dir)
         _auto_push(run_dir, config)
         return 0
 
-    # Demo: acquisition in a background thread, dashboard in the foreground.
+    # Demo / workload: acquisition in a background thread; the foreground is the
+    # dashboard, or the workload command (acquisition stops when it exits).
     from gpu_power_monitor.web import serve
 
     run_dir = explicit_dir or unique_run_dir(
@@ -507,18 +543,117 @@ def run_hardware(
     thread = threading.Thread(target=_background_acquire, daemon=True)
     thread.start()
 
-    display_cfg = {
+    display_cfg = _display_cfg(config)
+    httpd = None
+    try:
+        if display and workload:
+            from gpu_power_monitor.web.server import start_server
+
+            httpd, _ = start_server(run_dir, display=display_cfg, host=config.display.host, port=port,
+                                    open_browser=not config.vm.enabled)
+        if workload:
+            _run_workload(workload)
+        else:
+            serve(run_dir, display=display_cfg, host=config.display.host, port=port,
+                  open_browser=not config.vm.enabled)
+    finally:
+        stop.set()
+        thread.join(timeout=15.0)
+        if httpd is not None:
+            from gpu_power_monitor.web.server import stop_server
+
+            stop_server(httpd)
+    _auto_push(run_dir, config)
+    return 0
+
+
+def _display_cfg(config) -> dict:
+    return {
         "window_sec": config.display.window_sec,
         "refresh_ms": config.display.refresh_ms,
         "stale_after_sec": config.display.stale_after_sec,
         "y_limits": config.display.y_limits,
         "fullscreen": config.display.fullscreen,
     }
+
+
+def _run_workload(workload: list[str]) -> int:
+    """Run the bracketed workload command; its exit code is reported, not raised."""
+    import subprocess
+
+    print(f"[INFO] Running workload: {' '.join(workload)}")
     try:
-        serve(run_dir, display=display_cfg, port=port, open_browser=True)
+        code = subprocess.run(workload).returncode
+    except FileNotFoundError:
+        print(f"[ERROR] Workload command not found: {workload[0]}")
+        return 127
+    except KeyboardInterrupt:
+        print("[INFO] Workload interrupted - stopping acquisition.")
+        return 130
+    print(f"[INFO] Workload finished (exit {code}) - stopping acquisition.")
+    return code
+
+
+def _run_hardware_in_vm(
+    config, *, display: bool, test: bool, gpus: str | None, port: int,
+    run_id: str | None, explicit_dir: Path | None, workload: list[str] | None,
+) -> int:
+    """`pai hardware` on gamma2: start the run inside the VM, watch it from here."""
+    import datetime as dt
+
+    from gpu_power_monitor import vm
+    from gpu_power_monitor.utils import request_stop, runs_root, sanitize_folder_name
+
+    if explicit_dir is None:
+        base = sanitize_folder_name(config.measurement_name)
+        run_id = f"{base}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        explicit_dir = runs_root(config.storage.output_root, test=test) / run_id
+        if explicit_dir.exists():
+            print(f"[ERROR] Run folder already exists: {explicit_dir}")
+            return 1
+    run_dir = explicit_dir
+    log_path = Path(config.storage.output_root) / ".pai" / f"{run_dir.name}.log"
+    try:
+        proc = vm.start_acquisition(
+            config.vm, run_id=run_dir.name, operator=config.operator, test=test, gpus=gpus, log_path=log_path,
+        )
+        print(f"[INFO] Starting acquisition in VM {config.vm.name or config.vm.host} ...")
+        vm.wait_for_start(run_dir, proc, config.vm.start_timeout_sec, log_path)
+    except vm.VmUnavailable as exc:
+        print(f"[ERROR] {exc}")
+        return 1
+    print(f"[INFO] Run directory: {run_dir}")
+
+    httpd = None
+    if display:
+        from gpu_power_monitor.web.server import start_server
+
+        httpd, _ = start_server(run_dir, display=_display_cfg(config), host=config.display.host,
+                                port=port, open_browser=False)
+    else:
+        print('[INFO] Dashboard: pai dashboard latest   (menu option 3)')
+    print(f'[INFO] Stop with Ctrl+C here, or from any shell: pai stop "{run_dir.name}"')
+
+    status = "running"
+    try:
+        if workload:
+            _run_workload(workload)
+            print("[INFO] Stopping acquisition in the VM ...")
+            request_stop(run_dir)
+        status = vm.wait_for_end(run_dir, proc)
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopping acquisition in the VM (this takes a few seconds) ...")
+        request_stop(run_dir)
+        status = vm.wait_for_end(run_dir, proc, timeout_sec=180.0)
     finally:
-        stop.set()
-        thread.join(timeout=15.0)
+        if httpd is not None:
+            from gpu_power_monitor.web.server import stop_server
+
+            stop_server(httpd)
+    if status == "running":
+        print(f"[WARN] The run did not finalize; check {log_path} and `pai runs list`.")
+        return 1
+    print(f"[INFO] Completed run: {run_dir} (status {status})")
     _auto_push(run_dir, config)
     return 0
 
@@ -765,6 +900,7 @@ def interactive_menu() -> int:
     _refresh_pending_transfers()
     print("  1) Start measurement (headless)        [developer]")
     print("  2) Start measurement + live dashboard   [demo]")
+    print("     (Ctrl+C stops the run; `pai stop latest` from another shell does too)")
     print("  3) Open dashboard - latest run (live)    [demo]")
     print("  4) Open dashboard - replay a past run    [demo]")
     print("  5) Archive a run (Globus -> cluster archive)")
@@ -839,7 +975,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hw.add_argument(
         "--operator",
-        help="Who is starting this run; recorded in the manifest (default: PAI_OPERATOR env).",
+        help="Who is starting this run; recorded in the manifest (default: PAI_OPERATOR env, else your username).",
+    )
+    p_hw.add_argument(
+        "workload", nargs=argparse.REMAINDER,
+        help="Optional: `-- CMD ...` runs CMD while acquiring and stops the run when it exits.",
     )
 
     p_stop = sub.add_parser("stop", help="Ask a running acquisition to stop cleanly.")
@@ -851,8 +991,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_dash.add_argument("--fullscreen", action="store_true", help="Video-wall fullscreen.")
     p_dash.add_argument(
         "--host",
-        default="127.0.0.1",
-        help="Address to serve on (default: this machine only; 0.0.0.0 = reachable from the network).",
+        default=None,
+        help="Address to serve on (default: display.host / PAI_DASHBOARD_HOST, normally this machine only; "
+        "0.0.0.0 = reachable from the network).",
     )
     p_dash.add_argument("--port", type=int, default=8000, help="Web dashboard port.")
     p_dash.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser.")
@@ -895,6 +1036,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "devices":
         return run_devices()
     if args.command == "hardware":
+        workload = list(args.workload or [])
+        if workload and workload[0] == "--":
+            workload = workload[1:]
         return run_hardware(
             simulate=args.simulate,
             display=args.display,
@@ -906,6 +1050,7 @@ def main(argv: list[str] | None = None) -> int:
             duration_sec=args.duration_sec,
             run_id=args.run_id,
             operator=args.operator,
+            workload=workload or None,
         )
     if args.command == "stop":
         return run_stop(args.run)

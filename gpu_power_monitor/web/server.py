@@ -271,23 +271,36 @@ def _wait_for_existing_client(activity: dict, wait_sec: float = 1.5) -> bool:
     return False
 
 
-def serve(
+def _public_url(host: str, port: int) -> str:
+    """The URL to tell people: a bind-all host is shown as this machine's name."""
+    if host in ("0.0.0.0", "::", ""):
+        return f"http://{socket.gethostname()}:{port}/"
+    return f"http://{host}:{port}/"
+
+
+def start_server(
     run_dir: Path,
     display: dict | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
     open_browser: bool = True,
-) -> None:
+):
+    """Bind and start serving in a background thread; returns (httpd, url).
+
+    Callers that need to do other work while the dashboard runs (the gamma2
+    host waiting on a run inside the VM) use this directly; `serve()` wraps it
+    for the foreground case.
+    """
     run_dir = Path(run_dir)
     display = {**DEFAULT_DISPLAY, **(display or {})}
     activity = {"last_poll": 0.0}
     handler = _make_handler(run_dir, display, activity)
     httpd, port = create_server(host, port, handler)
-    url = f"http://{host}:{port}/"
+    url = _public_url(host, port)
     print(f"[INFO] Dashboard for {run_dir.name} at {url}")
-    print("[INFO] Press Ctrl+C to stop.")
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
+    httpd._pai_thread = thread  # type: ignore[attr-defined]
     if open_browser:
         if _wait_for_existing_client(activity):
             print("[INFO] Reusing the already-open dashboard tab.")
@@ -295,11 +308,28 @@ def serve(
             import webbrowser
 
             webbrowser.open(url)
+    return httpd, url
+
+
+def stop_server(httpd) -> None:
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def serve(
+    run_dir: Path,
+    display: dict | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    open_browser: bool = True,
+) -> None:
+    httpd, _ = start_server(run_dir, display, host=host, port=port, open_browser=open_browser)
+    thread = httpd._pai_thread  # type: ignore[attr-defined]
+    print("[INFO] Press Ctrl+C to stop.")
     try:
         while thread.is_alive():
             thread.join(0.5)
     except KeyboardInterrupt:
         print("\n[INFO] Dashboard stopped.")
     finally:
-        httpd.shutdown()
-        httpd.server_close()
+        stop_server(httpd)

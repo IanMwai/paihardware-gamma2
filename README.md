@@ -11,12 +11,11 @@ power data.
 **This is the gamma2 variant** of [paihardware](https://github.com/IanMwai/paihardware)
 (the 3.102 / gamma deployment, which stays untouched). On gamma2 the DAQ
 machine is a Windows VM running *on* the GPU server, and every measurement is
-started, watched and archived from the server's Linux shell. The acquisition
-code is the same; this repo adds the controls that make remote driving
-possible and the deployment files for the VM. **Start with
-[`deploy/gamma2/README.md`](deploy/gamma2/README.md)** for setup and daily use
-on gamma2; the rest of this document describes the `pai` tool itself and still
-applies.
+started, watched and archived from the server's Linux shell with the same
+`pai` commands and menu. The acquisition code is the same; this repo adds the
+"DAQ is in a VM" mode and the deployment files for it. **Setup lives in
+[`deploy/gamma2/README.md`](deploy/gamma2/README.md)**; everything below about
+using `pai` applies on gamma2 as written.
 
 ## Deployment context and assumptions
 
@@ -26,10 +25,12 @@ applies.
   and runs on any Windows setup with the NI-DAQmx driver and NI-DAQ hardware.
   The only machine-specific state is the `.env` file and the DAQ device name
   (see setup below).
-- **Driven from gamma2:** `pai-run start|stop|with` on the host starts
-  acquisition in the VM over SSH, serves the dashboard on gamma2, and stops a
-  run by dropping a `STOP` file into the run folder, which lives on gamma2's
-  disk (shared to the VM). Nobody opens the Windows desktop for a measurement.
+- **Driven from gamma2:** the same `pai` commands and menu as on the lab PC,
+  typed on gamma2. Because the host's `.env` names the VM (`PAI_VM_*`),
+  `pai hardware` starts acquisition inside the VM over SSH, serves the
+  dashboard on gamma2, and stops the run by dropping a `STOP` file into the
+  run folder, which lives on gamma2's disk (shared to the VM). Nobody opens the
+  Windows desktop for a measurement.
 - **Archiving assumes Harvard FASRC:** the default destination is the Le Xie
   lab's holylabs path via the FASRC Globus collection. Another lab (e.g.
   Minlan's) points `PAI_ARCHIVE_ROOT` (and, if needed,
@@ -217,6 +218,22 @@ wiring) is started with `--test` — see
 pai hardware --test --simulate
 ```
 
+Bracket a workload: everything after `--` runs while acquiring, and the run
+stops when it exits. On gamma2 this is the one-liner that gives you power and
+NVML data for exactly one job:
+
+```bash
+pai hardware --name resnet_sweep -- python train.py
+```
+
+**On gamma2** every one of these commands works unchanged; the only difference
+is where the samples come from. The host's `.env` names the VM that owns the
+DAQ, so `pai hardware` starts the same `pai hardware` inside the VM over SSH
+(with `--run-id` so both sides agree on the run folder), prints the run folder
+and the dashboard URL, and waits. `Ctrl+C` stops the run in the VM cleanly, as
+does `pai stop latest` from any other shell. The run folder is on gamma2's
+disk, shared to the VM, so the CSV chunks are on gamma2 as they are written.
+
 Runs are written under `output/<measurement_name>_<timestamp>/`. Press `Ctrl+C`
 to stop a run cleanly, or from any machine that can see the run folder:
 
@@ -229,11 +246,10 @@ it (every 0.5 s) and takes the same clean exit path as `Ctrl+C` (NVML fetch,
 manifest, checksums), then removes the marker. It is how gamma2 stops a run
 inside the VM.
 
-Two flags exist for controllers on another machine (gamma2's `pai-run` uses
-both): `--run-id NAME` creates exactly `output/NAME/` (no timestamp appended;
-refused if it exists), so the caller knows the run path before acquisition
-starts; `--operator WHO` records who started the run in the manifest
-(`PAI_OPERATOR` in the environment is the default).
+Two further flags: `--run-id NAME` creates exactly `output/NAME/` (no
+timestamp appended; refused if it exists), which is how the gamma2 host tells
+the VM where to write; `--operator WHO` records who started the run in the
+manifest (default: `PAI_OPERATOR`, else your username).
 
 ## View dashboard
 
@@ -243,10 +259,14 @@ streams from the live snapshot files the acquisition writes and opens in a brows
 ```bash
 pai dashboard output/<run_id>
 pai dashboard latest                 # the newest run
-pai dashboard latest --host 0.0.0.0  # reachable from other machines (gamma2 serves it this way)
 ```
 
-By default the server listens on this machine only (`127.0.0.1`).
+By default the server listens on this machine only (`127.0.0.1`). gamma2 sets
+`PAI_DASHBOARD_HOST=0.0.0.0` in its `.env` so the dashboard is reachable from
+any laptop on the Harvard network at `http://gamma2:8000/` (off campus:
+`ssh -L 8000:localhost:8000 admin@gamma2`, then `http://localhost:8000/`);
+`--host` overrides per command. On a headless host no browser is opened; the
+URL is printed instead.
 
 For a video wall, open the browser fullscreen (or pass `--fullscreen`). Useful
 flags: `--port <n>` and `--no-browser`.
