@@ -195,13 +195,37 @@ If `nvml` is missing, the VM → gamma2 key (step 4.5) is missing or
 
 Globus Connect Personal for Linux runs headless on gamma2 as the `pai` user
 with `/srv/pai` in its accessible paths; its endpoint UUID goes into
-`/opt/pai/paihardware-gamma2/.env` as `PAI_GLOBUS_LOCAL_ENDPOINT_ID`. Then
-once: `sudo -u pai -H /opt/pai/paihardware-gamma2/.venv/bin/globus login` and
-`... globus session update globus.rc.fas.harvard.edu`. Archived files on
-holylabs are owned by whichever FASRC identity that login used (same model as
-the 3.102 machine). The sweep timer then pushes every `ready_to_archive` run;
-`systemctl status pai-archive-sweep` and `journalctl -u pai-archive-sweep`
-show what it did.
+`/opt/pai/paihardware-gamma2/.env` as `PAI_GLOBUS_LOCAL_ENDPOINT_ID`.
+
+The Globus CLI lives in the same venv as `pai` (`pip install -e .[archive]`
+puts it there, exactly as on the 3.102 machine) and is put on everyone's
+PATH the same way `pai` is:
+
+```bash
+sudo ln -sf /opt/pai/paihardware-gamma2/.venv/bin/globus /usr/local/bin/globus
+globus version
+```
+
+Then once, as the account that owns the archive pushes:
+`sudo -u pai -H globus login` and
+`sudo -u pai -H globus session update globus.rc.fas.harvard.edu`. Archived
+files on holylabs are owned by whichever FASRC identity that login used (same
+model as the 3.102 machine). The sweep timer then pushes every
+`ready_to_archive` run; `systemctl status pai-archive-sweep` and
+`journalctl -u pai-archive-sweep` show what it did.
+
+Globus logins are per Linux user (tokens live in `~/.globus`), so your own
+`globus login` lets *you* push and browse (`pai archive push <run>`,
+`globus ls ...`) while the timer keeps using the `pai` login.
+
+To update the CLI (or `pai` and its dependencies in one go):
+
+```bash
+cd /opt/pai/paihardware-gamma2
+sudo -u pai -H git pull
+sudo -u pai -H .venv/bin/pip install -U -e .[archive]   # or: ... pip install -U globus-cli
+globus version
+```
 
 ## How it differs from the 3.102 Windows machine
 

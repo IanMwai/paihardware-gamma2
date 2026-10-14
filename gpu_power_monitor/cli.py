@@ -107,6 +107,19 @@ def _resolve_run(run: str | Path) -> Path:
     for candidate in (_output_root() / path.name, _output_root() / TEST_RUNS_SUBDIR / path.name):
         if candidate.is_dir():
             return candidate
+    if any(ch in path.name for ch in "*?["):
+        # A shell glob that matched nothing in the cwd (runs live under
+        # output/, not the repo) arrives literally; honour it if it names
+        # exactly one run.
+        matches = sorted(
+            d for root in (_output_root(), _output_root() / TEST_RUNS_SUBDIR)
+            for d in root.glob(path.name) if d.is_dir()
+        )
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            print(f"[ERROR] '{path.name}' matches {len(matches)} runs: "
+                  + ", ".join(m.name for m in matches))
     return path
 
 
@@ -172,6 +185,9 @@ def run_archive(command: str, run_dir: Path, **kwargs) -> int:
     from gpu_power_monitor.config import load_config
 
     run_dir = _resolve_run(run_dir)
+    if not run_dir.is_dir():
+        print(f"[ERROR] No such run: {run_dir}  (try: pai runs list)")
+        return 1
     config = load_config(kwargs.get("config_path") or _default_config())
     archive_root = Path(kwargs.get("archive_root") or config.storage.archive_root)
     if command == "copy":

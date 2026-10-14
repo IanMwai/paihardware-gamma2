@@ -153,3 +153,19 @@ def test_dot_folders_are_not_runs(tmp_path, monkeypatch):
     (tmp_path / "test" / ".cache").mkdir(parents=True)
     assert [r.name for r in cli._list_runs()] == [run.name]
     assert cli._resolve_run("latest") == run
+
+
+def test_archive_status_unknown_run_is_clean(tmp_path, monkeypatch, capsys):
+    from gpu_power_monitor import cli
+
+    monkeypatch.setattr(cli, "_output_root", lambda: tmp_path)
+    assert cli.run_archive("status", "gamma2_idle_baseline_*") == 1
+    assert "No such run" in capsys.readouterr().out
+
+
+def test_resolve_run_accepts_unique_glob(tmp_path, monkeypatch):
+    from gpu_power_monitor import cli
+
+    (tmp_path / "gamma2_idle_baseline_20261014_023221").mkdir()
+    monkeypatch.setattr(cli, "_output_root", lambda: tmp_path)
+    assert cli._resolve_run("gamma2_idle_baseline_*").name == "gamma2_idle_baseline_20261014_023221"
