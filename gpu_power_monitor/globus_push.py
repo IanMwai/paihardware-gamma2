@@ -78,9 +78,27 @@ def globus_unready_reason(cfg: GlobusConfig) -> str | None:
             "Globus endpoint IDs are not configured - set PAI_GLOBUS_LOCAL_ENDPOINT_ID "
             "(this machine's Globus Connect Personal endpoint) in .env"
         )
-    if shutil.which("globus") is None:
+    if globus_bin() is None:
         return "globus-cli is not installed - run: pip install globus-cli"
     return None
+
+
+def globus_bin() -> str | None:
+    """Path of the globus CLI.
+
+    The CLI is installed into the same venv as pai, so look next to this
+    interpreter first: when pai is started through a symlink or by full path
+    (the gamma2 host, the archive timer, the VM over SSH) the venv's bin
+    directory is not on PATH. Fall back to PATH for other layouts.
+    """
+    import os
+    import sys
+
+    name = "globus.exe" if os.name == "nt" else "globus"
+    beside = Path(sys.executable).parent / name
+    if beside.exists():
+        return str(beside)
+    return shutil.which("globus")
 
 
 def _gcp_path(path: Path) -> str:
@@ -95,7 +113,7 @@ def _run_globus(args: list[str]) -> dict:
     """Run a globus CLI command and return its parsed JSON output."""
     try:
         proc = subprocess.run(
-            ["globus", *args, "--format", "json"],
+            [globus_bin() or "globus", *args, "--format", "json"],
             capture_output=True,
             text=True,
             timeout=60,
