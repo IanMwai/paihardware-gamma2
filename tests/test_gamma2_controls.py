@@ -169,3 +169,21 @@ def test_resolve_run_accepts_unique_glob(tmp_path, monkeypatch):
     (tmp_path / "gamma2_idle_baseline_20261014_023221").mkdir()
     monkeypatch.setattr(cli, "_output_root", lambda: tmp_path)
     assert cli._resolve_run("gamma2_idle_baseline_*").name == "gamma2_idle_baseline_20261014_023221"
+
+
+def test_workload_gets_run_dir_env(tmp_path, monkeypatch):
+    import subprocess
+
+    from gpu_power_monitor import cli
+
+    seen = {}
+
+    def fake_run(cmd, env=None):
+        seen["env"] = env
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    run_dir = tmp_path / "demo_run"
+    assert cli._run_workload(["true"], run_dir) == 0
+    assert seen["env"]["PAI_RUN_DIR"] == str(run_dir)
+    assert seen["env"]["PAI_RUN_ID"] == "demo_run"

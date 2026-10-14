@@ -226,6 +226,19 @@ NVML data for exactly one job:
 pai hardware --name resnet_sweep -- python train.py
 ```
 
+The workload sees `PAI_RUN_DIR` and `PAI_RUN_ID`, so it can write its own logs
+into `<run>/workload/` and have them archived with the measurement.
+
+Workloads themselves (an inference server under a daily arrival pattern,
+training sweeps, ...) live in the separate
+[`pai-workloads`](https://github.com/IanMwai/pai-workloads) repo, so this
+one stays about measuring. For example:
+
+```bash
+pai hardware --name day_inference -- nhpp-load --url http://127.0.0.1:8001/v1 \
+    --model Qwen/Qwen2.5-7B-Instruct --hours 24 --compress 12
+```
+
 **On gamma2** every one of these commands works unchanged; the only difference
 is where the samples come from. The host's `.env` names the VM that owns the
 DAQ, so `pai hardware` starts the same `pai hardware` inside the VM over SSH

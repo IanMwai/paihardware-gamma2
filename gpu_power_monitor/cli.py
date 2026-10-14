@@ -568,7 +568,7 @@ def run_hardware(
             httpd, _ = start_server(run_dir, display=display_cfg, host=config.display.host, port=port,
                                     open_browser=not config.vm.enabled)
         if workload:
-            _run_workload(workload)
+            _run_workload(workload, run_dir)
         else:
             serve(run_dir, display=display_cfg, host=config.display.host, port=port,
                   open_browser=not config.vm.enabled)
@@ -593,13 +593,23 @@ def _display_cfg(config) -> dict:
     }
 
 
-def _run_workload(workload: list[str]) -> int:
-    """Run the bracketed workload command; its exit code is reported, not raised."""
+def _run_workload(workload: list[str], run_dir: Path | None = None) -> int:
+    """Run the bracketed workload command; its exit code is reported, not raised.
+
+    The workload sees ``PAI_RUN_DIR`` / ``PAI_RUN_ID`` so it can write its own
+    logs into the run folder (``<run>/workload/``), where they are archived
+    with the measurement.
+    """
+    import os
     import subprocess
 
+    env = dict(os.environ)
+    if run_dir is not None:
+        env["PAI_RUN_DIR"] = str(run_dir)
+        env["PAI_RUN_ID"] = run_dir.name
     print(f"[INFO] Running workload: {' '.join(workload)}")
     try:
-        code = subprocess.run(workload).returncode
+        code = subprocess.run(workload, env=env).returncode
     except FileNotFoundError:
         print(f"[ERROR] Workload command not found: {workload[0]}")
         return 127
@@ -653,7 +663,7 @@ def _run_hardware_in_vm(
     status = "running"
     try:
         if workload:
-            _run_workload(workload)
+            _run_workload(workload, run_dir)
             print("[INFO] Stopping acquisition in the VM ...")
             request_stop(run_dir)
         status = vm.wait_for_end(run_dir, proc)
