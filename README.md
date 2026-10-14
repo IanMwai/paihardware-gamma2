@@ -561,9 +561,13 @@ change them unless the wiring changes:
   input reads the shunt drop, not the 12 V rail). On gamma2 all four are
   wired the same way round (`current_sign: 1`); a shunt wired the other way
   reads negative under load and gets `current_sign: -1`.
-- `nvidia-smi` index ↔ DAQ label on gamma2 (from load tests; extend as the
-  others are confirmed): index 1 = GPU2. Needed to pair `nvml/nvml.csv` rows
-  with the DAQ columns in analysis.
+- `nvidia-smi` index ↔ DAQ label on gamma2 (confirmed by loading one card at
+  a time): index 0 = GPU1, 1 = GPU2, 2 = GPU3, 3 = GPU4, i.e. `gpu<N>` columns
+  pair with `nvml/nvml.csv` index `N-1`. Re-check after any reseating or
+  rewiring, since both orders can change. Under a full load each channel
+  reads ~250-270 W against nvidia-smi's 280 W cap: the shunts are on the
+  8-pin cables, so the ~30 W that comes through the PCIe slot is not
+  measured.
 - Sample rate `10000` Hz, power moving average `10` samples, CSV chunk
   rotation every `60` s
 - CSV columns: `time_s`, then `gpuN_voltage_v / gpuN_current_a / gpuN_power_w`
