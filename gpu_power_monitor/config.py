@@ -55,13 +55,14 @@ class GpuChannel:
         return f"{device}/{self.current}"
 
 
-# Calibrated 2026-09 against a 12.18 V reference; GPU2-4 shunts are wired
-# opposite to GPU1, hence the sign flips.
+# Fallback when the YAML has no channels.gpus list (configs/default.yaml is
+# the source of truth). Calibrated 2026-09 against a 12.18 V reference; on
+# gamma2 all four shunts are wired the same way round, so no sign flips.
 DEFAULT_GPUS: tuple[GpuChannel, ...] = (
     GpuChannel("GPU1", "ai0", "ai1", 12.18 / 2.569, 1.0),
-    GpuChannel("GPU2", "ai2", "ai3", 12.18 / 2.641, -1.0),
-    GpuChannel("GPU3", "ai4", "ai5", 12.18 / 2.641, -1.0),
-    GpuChannel("GPU4", "ai6", "ai7", 12.18 / 2.644, -1.0),
+    GpuChannel("GPU2", "ai2", "ai3", 12.18 / 2.641, 1.0),
+    GpuChannel("GPU3", "ai4", "ai5", 12.18 / 2.641, 1.0),
+    GpuChannel("GPU4", "ai6", "ai7", 12.18 / 2.644, 1.0),
 )
 
 

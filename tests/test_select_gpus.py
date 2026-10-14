@@ -34,10 +34,13 @@ def test_unknown_gpu_lists_valid_choices():
 
 
 def test_subset_calibration_survives():
+    # Selecting a subset must keep each GPU's own calibration, not renumber
+    # them: GPU2's divider ratio differs from GPU1's.
     subset = select_gpus(AcquisitionConfig(), "2")
     gpu = subset.channels.gpus[0]
     assert gpu.label == "GPU2"
-    assert gpu.current_sign == -1.0
+    assert gpu.voltage_scale == 12.18 / 2.641
+    assert gpu.voltage_scale != AcquisitionConfig().channels.gpus[0].voltage_scale
 
 
 def test_single_gpu_simulated_run_writes_only_its_columns(tmp_path):

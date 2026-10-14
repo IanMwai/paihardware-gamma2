@@ -556,8 +556,14 @@ change them unless the wiring changes:
   `ai0/ai1` (GPU1), `ai2/ai3` (GPU2), `ai4/ai5` (GPU3), `ai6/ai7` (GPU4)
 - Per-GPU calibrated voltage divider ratios (12.18 V reference): `4.7411`,
   `4.6119`, `4.6119`, `4.6067`
-- Shared 0.08 Ω shunt → current scale `12.5`; GPU2–4 shunts are wired opposite
-  to GPU1, corrected with `current_sign: -1`
+- Shared 0.08 Ω shunt → current scale `12.5`. Each shunt sits in the GPU's
+  ground return (`AI GND` on the supply side, `ai<n>` on the load side, so the
+  input reads the shunt drop, not the 12 V rail). On gamma2 all four are
+  wired the same way round (`current_sign: 1`); a shunt wired the other way
+  reads negative under load and gets `current_sign: -1`.
+- `nvidia-smi` index ↔ DAQ label on gamma2 (from load tests; extend as the
+  others are confirmed): index 1 = GPU2. Needed to pair `nvml/nvml.csv` rows
+  with the DAQ columns in analysis.
 - Sample rate `10000` Hz, power moving average `10` samples, CSV chunk
   rotation every `60` s
 - CSV columns: `time_s`, then `gpuN_voltage_v / gpuN_current_a / gpuN_power_w`
