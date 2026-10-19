@@ -547,8 +547,7 @@ def run_hardware(
         # Headless (developer): acquisition in the foreground, Ctrl+C to stop
         # (or `pai stop <run>` from any machine that sees the run folder).
         run_dir = acquire(config, simulate=simulate, duration_sec=duration_sec, run_dir=explicit_dir)
-        _auto_push(run_dir, config)
-        return 0
+        return _finish_hardware_run(run_dir, config)
 
     # Demo / workload: acquisition in a background thread; the foreground is the
     # dashboard, or the workload command (acquisition stops when it exits).
@@ -558,11 +557,13 @@ def run_hardware(
         runs_root(config.storage.output_root, test=test), config.measurement_name
     )
     stop = threading.Event()
+    acquisition_errors = []
 
     def _background_acquire() -> None:
         try:
             acquire(config, simulate=simulate, run_dir=run_dir, stop_event=stop, duration_sec=duration_sec)
         except Exception as exc:  # surface, don't kill the dashboard
+            acquisition_errors.append(exc)
             print(f"[ERROR] Acquisition stopped: {exc}")
 
     thread = threading.Thread(target=_background_acquire, daemon=True)
@@ -570,6 +571,7 @@ def run_hardware(
 
     display_cfg = _display_cfg(config)
     httpd = None
+    workload_code = 0
     try:
         if display and workload:
             from gpu_power_monitor.web.server import start_server
@@ -577,7 +579,7 @@ def run_hardware(
             httpd, _ = start_server(run_dir, display=display_cfg, host=config.display.host, port=port,
                                     open_browser=not config.vm.enabled)
         if workload:
-            _run_workload(workload, run_dir,
+            workload_code = _run_workload(workload, run_dir,
                           abort_if=lambda: None if thread.is_alive() else "Acquisition stopped")
         else:
             serve(run_dir, display=display_cfg, host=config.display.host, port=port,
@@ -589,8 +591,12 @@ def run_hardware(
             from gpu_power_monitor.web.server import stop_server
 
             stop_server(httpd)
-    _auto_push(run_dir, config)
-    return 0
+    if thread.is_alive():
+        print(f"[ERROR] Acquisition did not finish; inspect {run_dir}")
+        return 1
+    if acquisition_errors:
+        return 1
+    return _finish_hardware_run(run_dir, config, workload_code)
 
 
 def _display_cfg(config) -> dict:
@@ -728,13 +734,15 @@ def _run_hardware_in_vm(
     print(f'[INFO] Stop with Ctrl+C here, or from any shell: pai stop "{run_dir.name}"')
 
     status = "running"
+    workload_code = 0
     try:
         if workload:
-            _run_workload(workload, run_dir, abort_if=lambda: _acquisition_failed(run_dir))
+            workload_code = _run_workload(workload, run_dir, abort_if=lambda: _acquisition_failed(run_dir))
             print("[INFO] Stopping acquisition in the VM ...")
             request_stop(run_dir)
         status = vm.wait_for_end(run_dir, proc)
     except KeyboardInterrupt:
+        workload_code = 130 if workload else 0
         print("\n[INFO] Stopping acquisition in the VM (this takes a few seconds) ...")
         request_stop(run_dir)
         status = vm.wait_for_end(run_dir, proc, timeout_sec=180.0)
@@ -746,7 +754,28 @@ def _run_hardware_in_vm(
     if status == "running":
         print(f"[WARN] The run did not finalize; check {log_path} and `pai runs list`.")
         return 1
-    print(f"[INFO] Completed run: {run_dir} (status {status})")
+    return _finish_hardware_run(run_dir, config, workload_code)
+
+
+def _finish_hardware_run(run_dir: Path, config, workload_code: int = 0) -> int:
+    """Only a completed acquisition with a successful workload is success."""
+    from gpu_power_monitor.manifest import load_manifest, update_manifest
+
+    try:
+        data = load_manifest(run_dir)
+    except (OSError, ValueError) as exc:
+        print(f"[ERROR] Cannot confirm acquisition completion: {exc}")
+        return 1
+    if data.get("status") != "completed":
+        print(f"[ERROR] Acquisition did not complete: {run_dir} "
+              f"(status {data.get('status')}; {data.get('error', 'see VM log')})")
+        return 1
+    if workload_code:
+        update_manifest(run_dir, status="error", archive_status="archive_error",
+                        workload_exit_code=workload_code, error=f"Workload exited with code {workload_code}")
+        print(f"[ERROR] Workload failed with exit {workload_code}; run is not successful: {run_dir}")
+        return workload_code if workload_code > 0 else 1
+    print(f"[INFO] Completed run: {run_dir} (status completed)")
     _auto_push(run_dir, config)
     return 0
 

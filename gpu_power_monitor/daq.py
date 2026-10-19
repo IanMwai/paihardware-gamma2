@@ -54,31 +54,35 @@ class NIDaqSource:
 
     def start(self) -> None:
         task = self._nidaqmx.Task()
-        terminal = self._terminal_config(self.channels.terminal)
-        # Interleaved V/I pairs per GPU: GPU1 V, GPU1 I, GPU2 V, GPU2 I, ...
-        # read() unpacks channels back out by this order.
-        for gpu in self.channels.gpus:
-            for physical in (
-                gpu.voltage_physical(self.channels.device),
-                gpu.current_physical(self.channels.device),
-            ):
-                task.ai_channels.add_ai_voltage_chan(
-                    physical,
-                    min_val=float(self.channels.min_v),
-                    max_val=float(self.channels.max_v),
-                    terminal_config=terminal,
-                )
-        task.timing.cfg_samp_clk_timing(
-            rate=self.sample_rate_hz,
-            source="",
-            active_edge=self._Edge.RISING,
-            sample_mode=self._AcquisitionType.CONTINUOUS,
-            # Host-side buffer. DAQmx raises -200279 ("not able to keep up") the
-            # moment the reader falls this far behind, so make it generous: a
-            # VM or network-share stall of up to a minute is survivable.
-            samps_per_chan=int(max(self.chunk_size * 200, int(self.sample_rate_hz) * 60)),
-        )
-        task.start()
+        try:
+            terminal = self._terminal_config(self.channels.terminal)
+            # Interleaved V/I pairs per GPU: GPU1 V, GPU1 I, GPU2 V, GPU2 I, ...
+            # read() unpacks channels back out by this order.
+            for gpu in self.channels.gpus:
+                for physical in (
+                    gpu.voltage_physical(self.channels.device),
+                    gpu.current_physical(self.channels.device),
+                ):
+                    task.ai_channels.add_ai_voltage_chan(
+                        physical,
+                        min_val=float(self.channels.min_v),
+                        max_val=float(self.channels.max_v),
+                        terminal_config=terminal,
+                    )
+            task.timing.cfg_samp_clk_timing(
+                rate=self.sample_rate_hz,
+                source="",
+                active_edge=self._Edge.RISING,
+                sample_mode=self._AcquisitionType.CONTINUOUS,
+                # Host-side buffer. DAQmx raises -200279 ("not able to keep up") the
+                # moment the reader falls this far behind, so make it generous: a
+                # VM or network-share stall of up to a minute is survivable.
+                samps_per_chan=int(max(self.chunk_size * 200, int(self.sample_rate_hz) * 60)),
+            )
+            task.start()
+        except BaseException:
+            task.close()
+            raise
         self.task = task
 
     def stop(self) -> None:

@@ -66,12 +66,30 @@ if [[ -n $USERS && -n $VM_IP && -n ${SUDO_USER:-} ]]; then
       continue
     fi
     key=$(cat "$pub")
-    # append once; the file is ACL-restricted on Windows, hence PowerShell
-    if sudo -u "$SUDO_USER" ssh -o BatchMode=yes -o ConnectTimeout=10 "$VM_USER@$VM_IP" \
-        "powershell -NoProfile -Command \"\$f='C:\\ProgramData\\ssh\\administrators_authorized_keys'; if (-not (Select-String -Quiet -SimpleMatch '$key' \$f)) { Add-Content -Path \$f -Value '$key' }\"" ; then
-      log "VM accepts $u's ssh key"
+    # Encode the script so neither the Windows SSH shell nor nested
+    # PowerShell expands $f/$key before the command runs. Never prompt.
+    encoded=$(python3 - "$key" <<'PYENCODE'
+import base64
+import sys
+
+key = sys.argv[1].replace("'", "''")
+script = r"""$ErrorActionPreference = 'Stop'
+$f = 'C:\ProgramData\ssh\administrators_authorized_keys'
+$key = '__PUBLIC_KEY__'
+if (-not (Test-Path -LiteralPath $f)) { throw "Authorized-key file missing: $f; run the Windows base setup first." }
+if (-not (@(Get-Content -LiteralPath $f) -contains $key)) {
+    Add-Content -LiteralPath $f -Value $key -Encoding ascii
+}
+""".replace('__PUBLIC_KEY__', key)
+print(base64.b64encode(script.encode('utf-16le')).decode('ascii'))
+PYENCODE
+    )
+    if sudo -u "$SUDO_USER" ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$VM_USER@$VM_IP" \
+        "powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded" ; then
+      log "VM authorized-key file contains $u's ssh key; test access from $u's own shell"
     else
-      log "could not add $u's key to the VM (is $SUDO_USER's own key accepted there?)"
+      log "could not add $u's key to the VM; stopping setup. Check $SUDO_USER's SSH access and the Windows key-file permissions."
+      exit 1
     fi
   done
 fi

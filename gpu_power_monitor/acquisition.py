@@ -118,8 +118,8 @@ def acquire(
     failed = False
     stop_marker = stop_file(run_dir)
     next_stop_check = start
-    source.start()
     try:
+        source.start()
         while True:
             if stop_event is not None and stop_event.is_set():
                 break

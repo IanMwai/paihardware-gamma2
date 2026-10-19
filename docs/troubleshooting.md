@@ -16,6 +16,30 @@ virtual environment and run `pip install -e '.[hardware]'`. If that error
 appears on Gamma 2's Linux host, first check the host's `PAI_VM_*` settings;
 the host should be starting acquisition in Windows.
 
+## Windows Rejects My SSH Key
+
+If `pai devices` or shared setup reports `Permission denied`, check access
+from your own Gamma 2 Linux account:
+
+```bash
+ssh -o BatchMode=yes daqvnc1@192.168.122.51 whoami
+```
+
+Use the actual Windows acquisition username and VM address from the host
+`.env`. Linux group membership does not authorize an SSH key in Windows.
+Each operator needs their own key added, even if Linux `admin` can connect.
+Follow [Adding Each Operator](gamma2.md#adding-each-operator), or the
+[RDP bootstrap steps](gamma2.md#first-key-or-repair-through-rdp) if the setup
+operator's own key is not yet accepted. You can continue using your own
+Linux account throughout.
+
+The corrected shared setup script stops after a failed key-copy step. Older
+copies continued despite that failure. Check SSH and `pai devices` yourself
+before treating access as configured. If PowerShell prints a command beginning
+with `=C:\ProgramData`, stop it with `Ctrl+C` and update the host checkout;
+see the [setup quoting fix](gamma2.md#shared-setup-hangs-with-a-powershell-error).
+Do not copy the Linux host `.env` into Windows to solve an SSH failure.
+
 ## The Run Has No NVML Files
 
 Read the run's `nvml.status` in `manifest.json` and the terminal message.
@@ -50,3 +74,30 @@ the archive to verify, download the run, and work from the recorded files.
 Choose an unused port with `--port <number>` on `pai dashboard` or
 `pai hardware --display`. The workload examples use port 8001 for vLLM, so
 check that before choosing it for the dashboard.
+
+## Acquisition Cannot Keep Up With the Hardware
+
+NI's "The application is not able to keep up with the hardware acquisition"
+means samples were not read quickly enough and the DAQ buffer was overwritten.
+Treat that run as partial, even if an older controller printed `exit 0`.
+
+Update both the Linux and Windows copies of the measurement package. The
+controller now returns failure for an errored manifest or failed workload;
+the VM also releases a DAQ task that fails during startup. The dashboard
+preview is decimated before buffering and published at most twice a second.
+CSV logging remains at the configured 10 kHz, and whole-run preview statistics
+still use every processed sample. Turning off the browser alone did not remove
+the previous snapshot work from the acquisition loop.
+
+These software changes reduce a measured source of overhead; they do not
+prove the USB, VM, and shared-storage path can sustain a long acquisition.
+Before another full campaign, check a 30-minute test and then a short loaded
+measurement. Keep the sample rate unchanged, inspect the VM log and manifest,
+and check CSV sample coverage before accepting a run. If acquisition still
+falls behind, investigate VM scheduling, USB delivery, and shared-disk stalls.
+
+The workloads campaign now verifies manifests before trusting successful exit
+codes. Its trace campaign stops on an errored or unverified acquisition. Old
+campaign entries marked exit 0 with an errored manifest are retried on resume;
+missing or unreadable manifests also cannot establish success. Select runs
+explicitly with `--only` when resuming to avoid repeating a removed local run.

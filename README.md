@@ -15,9 +15,22 @@ holylabs storage. These runs will form an open dataset of GPU power profiles.
 
 You need an account on Gamma 2 and an FASRC account in the lab's group to
 read the archived data. Reach out to Ian or Raja for a Gamma 2 account. Your
-Gamma 2 account also needs to be in the `pai` group, with SSH access to the
-VM; an admin can set this up using the
-[shared-access instructions](docs/gamma2.md#7-host-open-it-up-to-the-lab).
+Gamma 2 account also needs membership in the `pai` and `libvirt` groups,
+and its own SSH key authorized in the Windows VM. This is a one-time setup
+for **each Linux user**. Being able to SSH into Gamma 2 does not automatically
+give you access from Gamma 2 to the VM.
+
+You keep using your own Linux account, such as `ian`. The commands connect
+to the shared Windows acquisition account (`PAI_VM_USER`, currently shown as
+`daqvnc1` in this guide), using your own SSH key. The VM checks that key;
+it does not grant access based on `ian@10.243.84.164` or the key's comment.
+Follow [Adding Each Operator](docs/gamma2.md#adding-each-operator) before
+your first measurement. You do not need to switch to Linux `admin`.
+
+The shared setup script can add other users' keys only when the person
+running it already has working SSH access to the VM. If your own key is not
+yet authorized, use the [RDP bootstrap steps](docs/gamma2.md#first-key-or-repair-through-rdp)
+first. A message saying you were added to groups does not confirm VM access.
 
 ## Check That the System Works
 

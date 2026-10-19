@@ -142,8 +142,9 @@ PAI_DASHBOARD_HOST=0.0.0.0
 `pai hardware` on gamma2 drives the VM; without them it would try to acquire
 locally and fail, which is the only way to get a confusing error here.
 
-SSH key for gamma2 → VM (used by `pai hardware`, as the human running it; one
-key per human, or a shared `admin` key):
+SSH key for Gamma 2 → VM: each operator uses their own Linux account and
+key. Start with the setup operator's key here, then authorize each additional
+operator using [Adding Each Operator](#adding-each-operator).
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ''    # if you have none
@@ -234,20 +235,112 @@ globus version
 
 ### 7. Host: open it up to the lab
 
-After the admin setup, use this script to give lab members access to the
-shared installation. Replace `alice,bob` with their Linux usernames. The
-example also installs vLLM and requests a dedicated data volume; read the
-options below before choosing those for your machine.
+After the base setup, give each operator access using their own Linux
+account and SSH key. Linux group membership and Windows SSH authorization
+are separate requirements. `PAI_VM_USER` names the shared Windows account;
+it does not need to match the operator's Linux username.
 
-```bash
-cd /opt/pai/paihardware-gamma2
-sudo bash deploy/gamma2/host/setup-shared.sh --users alice,bob --vllm --data-volume 10T
-```
+#### Adding Each Operator
 
-* `--users` adds people to the `pai` group (they log out and in once), and
-  copies their `~/.ssh/id_ed25519.pub` into the VM so `pai hardware` can
-  reach it as them. Users without a key run `ssh-keygen -t ed25519 -N ''`
-  first.
+1. On Gamma 2, the new operator checks for `~/.ssh/id_ed25519.pub`. If they
+   have no key pair yet, they run `ssh-keygen -t ed25519` as themselves.
+   Keep the private key in that account; only the `.pub` file is copied.
+2. A setup operator with sudo access and an SSH key already accepted by the
+   VM runs the script below. Replace `alice,bob` with the new Linux usernames.
+   The script uses the invoking user's key (`SUDO_USER`) to reach Windows;
+   `--users` lists whose public keys it will add. The invoking user can be
+   `ian` or any authorized maintainer, not necessarily Linux `admin`.
+
+   ```bash
+   cd /opt/pai/paihardware-gamma2
+   sudo bash deploy/gamma2/host/setup-shared.sh --users alice,bob
+   ```
+
+3. Each added user logs out and back in, then runs these from their own
+   Gamma 2 shell. Use the actual `PAI_VM_USER` and VM address from the host
+   configuration if they differ from this example.
+
+   ```bash
+   id -nG
+   ssh -o BatchMode=yes daqvnc1@192.168.122.51 whoami
+   pai devices
+   ```
+
+   `id -nG` should include `pai` and `libvirt`. SSH should print the Windows
+   account, and `pai devices` should show `Dev1`. A first connection may ask
+   you to verify the VM's host key; verify and accept it before repeating
+   the non-interactive check.
+
+If the invoking user has never been authorized in Windows, the script cannot
+use SSH to authorize that same user. Follow the RDP steps below to establish
+the first working connection. Do not copy another person's private key or
+change `PAI_VM_USER` to your Linux username.
+
+#### First Key or Repair Through RDP
+
+Use this when the setup operator's own SSH test fails with `Permission denied
+(publickey,password,keyboard-interactive)`.
+
+1. In that operator's Gamma 2 shell, run `cat ~/.ssh/id_ed25519.pub` and copy
+   the complete public-key line.
+2. From your own computer, open an RDP tunnel using your own Gamma 2 account:
+
+   ```bash
+   ssh -L 3389:192.168.122.51:3389 username@10.243.84.164
+   ```
+
+   Connect your RDP client to `127.0.0.1:3389` and sign in with the Windows
+   account. `virsh domifaddr daqwin` on Gamma 2 gives the current VM address.
+3. In an elevated Windows PowerShell, open the authorized-key file:
+
+   ```powershell
+   notepad C:\ProgramData\ssh\administrators_authorized_keys
+   ```
+
+   Append the operator's public key on its own line and preserve all existing
+   keys. This deployment uses a Windows administrator account for acquisition,
+   so OpenSSH reads this file rather than the account's personal
+   `.ssh/authorized_keys`. Preserve the restricted permissions from setup.
+   If those permissions need repair, use:
+
+   ```powershell
+   icacls.exe C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F"
+   ```
+
+   The two SIDs identify Windows Administrators and SYSTEM. See Microsoft's
+   [Windows OpenSSH key instructions](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement).
+4. Back in that operator's Gamma 2 shell, test SSH and then run shared setup
+   for the users who need access. For ian:
+
+   ```bash
+   ssh -o BatchMode=yes daqvnc1@192.168.122.51 whoami
+   cd /opt/pai/paihardware-gamma2
+   sudo bash deploy/gamma2/host/setup-shared.sh --users ian
+   ```
+
+This authorizes Linux → VM access. The VM → Linux key used for NVML is a
+separate connection configured in step 4.5; keep its existing configuration.
+The host and VM also need different `.env` files. Do not copy the host's
+`PAI_VM_*` configuration into Windows.
+
+#### What Shared Setup Installs
+
+The script adds the listed users to `pai` and `libvirt` and attempts to copy
+their public keys into Windows. A failed key-copy step stops setup. If you see `could not add ... key to
+the VM`, resolve it and repeat the SSH check before collecting data. Successful setup
+ends with `done. Users added to the group must log out and in again.`
+
+If it stops after adding groups, check that the host `.env` exists and
+contains `PAI_VM_USER`; a Git clone does not restore this ignored file.
+A GitHub username prompt is separate from VM access: the script clones or
+updates `pai-workloads` as Linux user `pai`, so that account needs repository
+access even if the invoking Linux user's GitHub login works.
+
+The optional `--vllm` flag installs vLLM. Treat `--data-volume SIZE` as a
+separate storage operation: it creates and formats an LVM volume and moves
+`/srv/pai`. Check existing mounts and free LVM space before using it. It is
+not needed just to add another user.
+
 * The workloads repo is installed at `/opt/pai/pai-workloads` and its
   commands (`nhpp-load`, `pai-campaign`) join `pai` and `globus` in
   `/usr/local/bin`. `--vllm` installs vLLM at `/opt/vllm` and puts `vllm`
@@ -335,3 +428,20 @@ the dataset index is built from.
   (setup-vm.ps1 sets both).
 * **Sweep timer pushes nothing** - `sudo -u pai -H .venv/bin/pai archive push-ready`
   by hand prints the reason (usually `globus login` expired).
+
+### Shared Setup Hangs With a PowerShell Error
+
+An older `setup-shared.sh` passed a PowerShell command through nested shells,
+which could expand `$f` before it reached the command. This produced a
+command starting with `=C:\ProgramData...` and could leave PowerShell waiting
+for input. Stop that attempt with `Ctrl+C` and update the host checkout.
+The corrected script uses an encoded, non-interactive PowerShell command
+and stops if key authorization fails. Rerun from your own Linux account:
+
+```bash
+sudo bash /opt/pai/paihardware-gamma2/deploy/gamma2/host/setup-shared.sh --users ian --vllm
+```
+
+Use your own username in place of `ian`. Leave storage migration out of an
+access-repair run. This quoting error does not require copying `.env` files
+or recreating the Windows account.
