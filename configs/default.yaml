@@ -1,0 +1,83 @@
+sample_rate_hz: 10000
+chunk_size: 1000
+measurement_name: "GPU Power Measurement Test"
+
+# One entry per GPU: its voltage tap / shunt channel pair, the calibrated
+# divider ratio for that tap (12.18 V reference, 2026-09 calibration), and the
+# shunt wiring sign. On gamma2 (rewired 2026-10) all four shunts sit in the
+# ground return in the same orientation, so no sign flips; set -1 for a GPU
+# whose shunt is wired the other way round (it reads negative under load).
+channels:
+  device: "Dev1"
+  terminal: "RSE"
+  min_v: -0.5
+  max_v: 3.5
+  gpus:
+    # voltage_scale = 12.18 / <measured raw volts at the tap>
+    - { label: "GPU1", voltage: "ai0", current: "ai1", voltage_scale: 4.741144, current_sign: 1 }
+    - { label: "GPU2", voltage: "ai2", current: "ai3", voltage_scale: 4.611890, current_sign: 1 }
+    - { label: "GPU3", voltage: "ai4", current: "ai5", voltage_scale: 4.611890, current_sign: 1 }
+    - { label: "GPU4", voltage: "ai6", current: "ai7", voltage_scale: 4.606657, current_sign: 1 }
+
+scaling:
+  # Shared 0.08 ohm shunt: scaled_current = raw * 12.5
+  current_scale: 12.5
+
+processing:
+  voltage_delay_samples: 0
+  current_delay_samples: 0
+  power_average_samples: 10
+
+display:
+  window_sec: 60
+  refresh_ms: 30
+  stale_after_sec: 2
+  fullscreen: false
+  y_limits:
+    voltage: [11.5, 13.0]
+    current: [-1.0, 15.0]
+    power: [-10.0, 180.0]
+
+logging:
+  chunk_duration_sec: 60
+  file_prefix: "nidaq"
+  format: "csv"
+  queue_blocks: 200
+  compress: true     # gzip finished chunks in the background (3-5x smaller)
+
+# The GPU workload machine ("gamma"). Credentials are machine-local: set
+# PAI_GAMMA_HOST / PAI_GAMMA_USER and PAI_GAMMA_PASSWORD (or
+# PAI_GAMMA_KEY_PATH) in .env. Without credentials the NVML integration
+# disables itself; a run never depends on gamma being reachable.
+remote:
+  enabled: true
+  # NVML logs for each run live at <remote_run_root>/<run_id>/ on gamma.
+  remote_run_root: "pai_runs"
+  # nvidia-smi logging interval (ms). NVML refreshes O(10 Hz); finer adds no info.
+  nvml_interval_ms: 100
+  connect_timeout_sec: 10
+
+# Machine- and lab-specific storage values live in a `.env` file at the repo
+# root (copy `.env.example` and fill it in). Anything set there overrides the
+# values below, so this shared file needs no per-machine edits.
+storage:
+  # PAI_OUTPUT_ROOT in .env overrides.
+  output_root: "output"
+  # Archive destination on the cluster. This default is the Le Xie lab path;
+  # other labs set PAI_ARCHIVE_ROOT in .env instead of editing this file.
+  archive_root: "/n/holylabs/lexie_lab/Lab/gpu_power_logs"
+  retention_days: 14
+  globus:
+    # UUID of this machine's Globus Connect Personal endpoint. Per machine —
+    # set PAI_GLOBUS_LOCAL_ENDPOINT_ID in .env (GCP tray icon -> Web:
+    # Collection Details). Left empty here on purpose; archiving is disabled
+    # with a clear message until it is set.
+    local_endpoint_id: ""
+    # UUID of the destination collection. This default is the
+    # "Harvard FAS RC Holyoke" mapped collection (serves /n/holylabs);
+    # PAI_GLOBUS_REMOTE_ENDPOINT_ID in .env overrides.
+    remote_endpoint_id: "1156ed9e-6984-11ea-af52-0201714f6eab"
+    # Submit a Globus transfer automatically when a run completes cleanly.
+    auto_push: true
+    # Give up on a queued transfer after this many days (Globus retries until then).
+    deadline_days: 7

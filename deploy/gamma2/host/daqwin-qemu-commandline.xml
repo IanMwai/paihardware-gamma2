@@ -1,0 +1,30 @@
+<!--
+  USB passthrough of the NI USB-6341 to the daqwin VM.
+
+  Why not a plain libvirt <hostdev>? NI's driver re-enumerates the device
+  during initialisation, and a libvirt hostdev is bound to the bus address the
+  device had when attached, so the VM lost it every time. QEMU's usb-host
+  device matched by vendor/product re-attaches on its own whenever a matching
+  device (re)appears, which also makes an unplug/replug self-healing.
+
+  The bootloader identity (74f8) must see guest resets (the driver resets it
+  before loading firmware). The running identity (735b, seen once during
+  bring-up) must NOT: a guest reset there knocks the device back to 74f8.
+
+  Apply with `EDITOR=nano virsh edit daqwin`: add the xmlns:qemu attribute to
+  the <domain> tag and the <qemu:commandline> block before </domain>.
+  Requires in /etc/libvirt/qemu.conf (then `systemctl restart libvirtd`):
+      security_driver = "none"
+      cgroup_controllers = [ "cpu", "cpuacct", "cpuset", "memory", "blkio" ]
+      namespaces = [ ]
+  and the udev rule 99-ni-usb-vm.rules.
+-->
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <!-- ... existing definition unchanged ... -->
+  <qemu:commandline>
+    <qemu:arg value='-device'/>
+    <qemu:arg value='usb-host,vendorid=0x3923,productid=0x74f8,id=ni-boot'/>
+    <qemu:arg value='-device'/>
+    <qemu:arg value='usb-host,vendorid=0x3923,productid=0x735b,guest-reset=off,id=ni-run'/>
+  </qemu:commandline>
+</domain>

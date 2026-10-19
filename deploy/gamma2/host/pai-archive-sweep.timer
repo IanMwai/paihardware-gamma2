@@ -1,0 +1,12 @@
+# /etc/systemd/system/pai-archive-sweep.timer
+# Enable with: sudo systemctl enable --now pai-archive-sweep.timer
+[Unit]
+Description=PAI: sweep for runs to archive every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Unit=pai-archive-sweep.service
+
+[Install]
+WantedBy=timers.target
