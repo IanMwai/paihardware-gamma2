@@ -25,7 +25,7 @@ def vm_env(tmp_path, monkeypatch):
 
     launched = []
 
-    def fake_start(cfg, *, run_id, operator, machine, test, gpus, log_path, config_name=None):
+    def fake_start(cfg, *, run_id, operator, machine, test, gpus, log_path, config_name=None, duration_sec=None, maximum_sec=None):
         launched.append({"run_id": run_id, "operator": operator, "machine": machine, "test": test, "gpus": gpus})
         args = [sys.executable, "-m", "gpu_power_monitor.cli", "hardware", "--simulate",
                 "--run-id", run_id, "--operator", operator, "--machine", machine]
@@ -63,7 +63,7 @@ def test_vm_mode_brackets_a_workload(vm_env):
 def test_vm_mode_reports_a_run_that_never_starts(vm_env, monkeypatch):
     out, _ = vm_env
 
-    def dead_start(cfg, *, run_id, operator, machine, test, gpus, log_path, config_name=None):
+    def dead_start(cfg, *, run_id, operator, machine, test, gpus, log_path, config_name=None, duration_sec=None, maximum_sec=None):
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("ssh: connect to host vm.invalid port 22: Connection timed out\n")
         return subprocess.Popen([sys.executable, "-c", "raise SystemExit(255)"])

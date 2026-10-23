@@ -46,6 +46,7 @@ def acquire(
     run_dir: Path | None = None,
     stop_event: threading.Event | None = None,
     print_fn: Callable[[str], None] = print,
+    progress_path: Path | None = None,
 ) -> Path:
     if run_dir is None:
         run_dir = unique_run_dir(
@@ -114,20 +115,35 @@ def acquire(
             print_fn(f"[WARN] Could not start the NVML logger on gamma: {exc}")
             nvml = None
 
-    start = time.time()
+    from .supervisor import write_json, read_json
+    sequence = 0
+    def progress(phase):
+        nonlocal sequence
+        if progress_path is not None:
+            sequence += 1
+            write_json(progress_path, {"phase": phase, "sequence": sequence,
+                       "acquired_samples": processor.sample_index,
+                       "written_samples": writer.samples_written,
+                       "queue_depth": writer.queue.qsize()})
+    start = time.monotonic()
     failed = False
     stop_marker = stop_file(run_dir)
     next_stop_check = start
+    next_progress = start
+    stop_reason = None
     try:
         source.start()
+        progress("ready")
         while True:
+            writer.check_health()
             if stop_event is not None and stop_event.is_set():
                 break
-            if duration_sec is not None and time.time() - start >= duration_sec:
+            if duration_sec is not None and time.monotonic() - start >= duration_sec:
                 break
-            if time.time() >= next_stop_check:
-                next_stop_check = time.time() + STOP_FILE_POLL_SEC
+            if time.monotonic() >= next_stop_check:
+                next_stop_check = time.monotonic() + STOP_FILE_POLL_SEC
                 if stop_marker.exists():
+                    stop_reason = read_json(stop_marker).get("reason")
                     print_fn("[INFO] Stop requested (STOP file found) - finishing the run.")
                     break
             available = source.available_samples()
@@ -141,6 +157,9 @@ def acquire(
             block = processor.process(raw_voltages, raw_currents)
             writer.write_block(block)
             live.append(block, state="LIVE")
+            if time.monotonic() >= next_progress:
+                progress("ready")
+                next_progress = time.monotonic() + 1
             if simulate:
                 time.sleep(len(raw_voltages[0]) / float(config.sample_rate_hz))
     except KeyboardInterrupt:
@@ -151,9 +170,18 @@ def acquire(
         live.mark_state("ERROR")
         raise
     finally:
-        source.stop()
+        progress("finalizing")
+        cleanup_error = None
+        try:
+            source.stop()
+        except Exception as exc:
+            cleanup_error = exc
         end_time = processor.sample_index / float(config.sample_rate_hz)
-        writer.finalize(end_time)
+        try:
+            writer.finalize(end_time)
+            progress("finalizing")
+        except Exception as exc:
+            cleanup_error = cleanup_error or exc
         if nvml is not None:
             # Fetch before finalize so the NVML files land in the manifest's
             # checksummed inventory (and therefore in the Globus archive).
@@ -173,10 +201,24 @@ def acquire(
             pass
         except OSError as exc:
             print_fn(f"[WARN] Could not remove {stop_marker.name}: {exc}")
+        if cleanup_error is not None:
+            failed = True
+            update_manifest(run_dir, status="error", archive_status="archive_error", error=str(cleanup_error))
+            live.mark_state("ERROR")
+            raise cleanup_error
         if not failed:
             # On failure the manifest already says status=error and the live
             # state ERROR; finalizing here would overwrite both with "completed".
-            finalize_manifest(run_dir, end_time)
-            live.mark_state("COMPLETE")
+            if writer.samples_written != processor.sample_index:
+                update_manifest(run_dir, status="error", archive_status="archive_error",
+                                error="Acquired/written sample count mismatch")
+                live.mark_state("ERROR")
+                raise RuntimeError("Acquired/written sample count mismatch")
+            finalize_manifest(run_dir, end_time, stats=writer.statistics())
+            if progress_path is not None and stop_reason not in (None, "workload_completed"):
+                update_manifest(run_dir, status="interrupted", archive_status="archive_error", error=stop_reason)
+                live.mark_state("ERROR")
+            else:
+                live.mark_state("COMPLETE")
     print_fn(f"[INFO] Completed run: {run_dir}")
     return run_dir

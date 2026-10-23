@@ -130,3 +130,10 @@ check its clock before starting another measurement.
 - [Gamma 2 setup](docs/gamma2.md): rebuilding the VM, shared storage, and lab access.
 - [Lab PC setup](docs/setup.md): the Windows setup this deployment builds on.
 - [Troubleshooting](docs/troubleshooting.md): what to check when a command fails.
+
+## Supervised runs and recovery
+
+Gamma 2 now uses a Windows-local supervisor and spool, bounded shutdown, and
+verified export. Update both machines before using it. See
+[supervised runs](docs/supervised-runs.md) for disk requirements, stop/recovery
+commands, and the short validation sequence before retrying three hours.

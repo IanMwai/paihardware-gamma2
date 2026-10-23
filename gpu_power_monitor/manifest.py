@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -85,11 +86,11 @@ def update_manifest(run_dir: Path, **updates) -> dict[str, Any]:
     return data
 
 
-def finalize_manifest(run_dir: Path, end_time_s: float) -> dict[str, Any]:
+def finalize_manifest(run_dir: Path, end_time_s: float, *, stats: dict | None = None) -> dict[str, Any]:
     run_dir = Path(run_dir)
     data = load_manifest(run_dir)
     files = build_file_inventory(run_dir)
-    stats = compute_run_stats(run_dir)
+    stats = compute_run_stats(run_dir) if stats is None else stats
     workload = load_workload_meta(run_dir)
     if workload is not None:
         data["workload"] = workload
@@ -122,7 +123,7 @@ def refresh_file_inventory(run_dir: Path) -> dict[str, Any]:
     return data
 
 
-def build_file_inventory(run_dir: Path) -> list[dict[str, Any]]:
+def build_file_inventory(run_dir: Path, *, deadline: float | None = None) -> list[dict[str, Any]]:
     run_dir = Path(run_dir)
     files = []
     for path in sorted(run_dir.rglob("*")):
@@ -135,16 +136,18 @@ def build_file_inventory(run_dir: Path) -> list[dict[str, Any]]:
             {
                 "path": rel,
                 "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
+                "sha256": sha256_file(path, deadline=deadline),
             }
         )
     return files
 
 
-def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
+def sha256_file(path: Path, block_size: int = 1024 * 1024, *, deadline: float | None = None) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as handle:
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("File verification deadline exceeded")
             block = handle.read(block_size)
             if not block:
                 break
@@ -153,38 +156,30 @@ def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
 
 
 def compute_run_stats(run_dir: Path) -> dict[str, float | None]:
-    powers = []
-    times = []
+    # Streaming accumulation keeps memory bounded for day-long 10 kHz runs.
+    count = 0
+    total = energy = 0.0
+    peak = None
+    previous = None
     for csv_path in chunk_paths(run_dir):
         with open_chunk(csv_path) as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
+            for row in csv.DictReader(handle):
                 try:
-                    p = float(row["total_power_w"])
-                    t = float(row["time_s"])
+                    p, t = float(row["total_power_w"]), float(row["time_s"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                if np.isfinite(p):
-                    powers.append(p)
-                    times.append(t)
-    if not powers:
-        return {
-            "average_power_w": None,
-            "peak_power_w": None,
-            "energy_j": None,
-            "sample_count": 0,
-        }
-    p_arr = np.asarray(powers, dtype=float)
-    t_arr = np.asarray(times, dtype=float)
-    # np.trapz was renamed to np.trapezoid in NumPy 2.0 and removed thereafter.
-    trapezoid = getattr(np, "trapezoid", None) or getattr(np, "trapz")
-    energy = float(trapezoid(p_arr, t_arr)) if p_arr.size > 1 else 0.0
-    return {
-        "average_power_w": float(np.mean(p_arr)),
-        "peak_power_w": float(np.max(p_arr)),
-        "energy_j": energy,
-        "sample_count": int(p_arr.size),
-    }
+                if not np.isfinite(p) or not np.isfinite(t):
+                    continue
+                count += 1
+                total += p
+                peak = p if peak is None else max(peak, p)
+                if previous is not None:
+                    old_t, old_p = previous
+                    energy += (t-old_t) * (p+old_p) / 2
+                previous = (t, p)
+    return {"average_power_w": total/count if count else None,
+            "peak_power_w": peak, "energy_j": energy if count else None,
+            "sample_count": count}
 
 
 WORKLOAD_META_NAME = "meta.json"

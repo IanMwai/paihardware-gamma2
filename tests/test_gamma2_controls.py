@@ -103,7 +103,7 @@ def test_resolve_latest_and_stop_command(tmp_path, monkeypatch):
         save_manifest(d, {"measurement_name": d.name, "run_id": d.name, "status": "running"})
         time.sleep(0.05)
     assert cli._resolve_run("latest") == newer
-    assert cli.run_stop("latest") == 0
+    assert cli.run_stop("latest", timeout_sec=0) == 1
     assert (newer / STOP_FILE_NAME).exists()
     assert not (older / STOP_FILE_NAME).exists()
     assert cli.run_stop("no-such-run") == 1

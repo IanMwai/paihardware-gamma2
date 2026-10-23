@@ -4,6 +4,7 @@ import csv
 import datetime as dt
 import queue
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -58,35 +59,54 @@ class ChunkWriter:
         self.compress = bool(compress)
         self._compress_threads: list[threading.Thread] = []
         self._last_written_t_end = 0.0
+        self.error: BaseException | None = None
+        self.samples_written = 0
+        self.power_sum = self.energy = 0.0
+        self.finite_samples = 0
+        self.power_peak = None
+        self.previous_sample = None
+        self.last_progress = time.monotonic()
         self.thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.thread.start()
 
     def write_block(self, block: ProcessedBlock) -> None:
         if block.time_s.size == 0:
             return
+        self.check_health()
         try:
-            self.queue.put(block, block=False)
-        except queue.Full:
-            try:
-                self.queue.get_nowait()
-                self.queue.task_done()
-            except Exception:
-                pass
-            try:
-                self.queue.put(block, block=False)
-            except Exception:
-                print("[WARNING] Writer queue full; dropping data block")
+            self.queue.put_nowait(block)
+        except queue.Full as exc:
+            raise RuntimeError("Writer queue full; acquisition stopped to avoid silent data loss") from exc
 
-    def finalize(self, t_end_sec: float) -> list[Path]:
+    def check_health(self) -> None:
+        if self.error is not None:
+            raise RuntimeError(f"CSV writer failed: {self.error}") from self.error
+        if not self.thread.is_alive() and not self.stop_event.is_set():
+            raise RuntimeError("CSV writer exited unexpectedly")
+
+    def finalize(self, t_end_sec: float, timeout_sec: float = 30.0) -> list[Path]:
         self.stop_event.set()
-        self.queue.join()
-        self.thread.join(timeout=10.0)
-        with self.lock:
-            if self._file is not None:
-                self._close_and_rename(float(t_end_sec))
-        for t in self._compress_threads:
-            t.join()
+        deadline = time.monotonic() + timeout_sec
+        # queue.join() can never finish after a writer exception or blocked I/O.
+        while self.thread.is_alive() and time.monotonic() < deadline:
+            self.thread.join(timeout=min(.1, max(0, deadline-time.monotonic())))
+        if self.thread.is_alive():
+            raise TimeoutError("CSV writer did not drain before shutdown deadline")
+        if self.error is not None:
+            raise RuntimeError(f"CSV writer failed: {self.error}") from self.error
+        for thread in self._compress_threads:
+            thread.join(timeout=max(0, deadline-time.monotonic()))
+            if thread.is_alive():
+                raise TimeoutError("Compression did not finish before shutdown deadline")
+        if self.error is not None:
+            raise RuntimeError(f"CSV writer failed: {self.error}") from self.error
         return list(self.closed_paths)
+
+    def statistics(self) -> dict:
+        return {"sample_count": self.finite_samples,
+                "average_power_w": self.power_sum/self.finite_samples if self.finite_samples else None,
+                "peak_power_w": self.power_peak,
+                "energy_j": self.energy if self.finite_samples else None}
 
     def _writer_loop(self) -> None:
         while not self.stop_event.is_set() or not self.queue.empty():
@@ -96,17 +116,40 @@ class ChunkWriter:
                 continue
             try:
                 self._write_block_locked(block)
+                valid = np.isfinite(block.total_power_w) & np.isfinite(block.time_s)
+                values, times = block.total_power_w[valid], block.time_s[valid]
+                self.finite_samples += int(times.size)
+                if self.previous_sample is not None and times.size:
+                    old_t, old_p = self.previous_sample
+                    self.energy += (float(times[0])-old_t)*(float(values[0])+old_p)/2
+                if times.size > 1:
+                    self.energy += float(np.sum(np.diff(times)*(values[1:]+values[:-1])/2))
+                if times.size:
+                    self.previous_sample = (float(times[-1]), float(values[-1]))
+                    peak = float(np.max(values))
+                    self.power_peak = peak if self.power_peak is None else max(self.power_peak, peak)
+                    self.power_sum += float(np.sum(values))
+                self.samples_written += int(block.time_s.size)
+                self.last_progress = time.monotonic()
+            except BaseException as exc:
+                self.error = exc
+                return
             finally:
                 self.queue.task_done()
-        with self.lock:
-            if self._file is not None:
-                self._close_and_rename(self._last_written_t_end)
+        try:
+            with self.lock:
+                if self._file is not None:
+                    self._close_and_rename(self._last_written_t_end)
+        except BaseException as exc:
+            self.error = exc
 
     def _write_block_locked(self, block: ProcessedBlock) -> None:
         sizes = [block.time_s.size, block.total_power_w.size]
         sizes += [arr.size for arr in block.voltage_v]
         sizes += [arr.size for arr in block.current_a]
         sizes += [arr.size for arr in block.power_w]
+        if len(set(sizes)) != 1:
+            raise ValueError("Mismatched sample arrays; refusing to truncate data")
         n = min(sizes) if sizes else 0
         if n == 0:
             return
@@ -182,7 +225,12 @@ class ChunkWriter:
         rename_with_fallback(self.tmp_path, final_path)
         if self.compress:
             gz_path = final_path.with_name(final_path.name + ".gz")
-            t = threading.Thread(target=_gzip_chunk, args=(final_path, gz_path), daemon=True)
+            def compress_chunk():
+                try:
+                    _gzip_chunk(final_path, gz_path)
+                except BaseException as exc:
+                    self.error = exc
+            t = threading.Thread(target=compress_chunk, daemon=True)
             t.start()
             self._compress_threads.append(t)
             self._compress_threads = [x for x in self._compress_threads if x.is_alive() or x is t]
@@ -210,3 +258,4 @@ def _gzip_chunk(src: Path, dst: Path) -> None:
             tmp.unlink()
         except OSError:
             pass
+        raise

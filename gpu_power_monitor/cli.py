@@ -285,27 +285,55 @@ def run_push_ready(*, config_path: Path | None = None) -> int:
     return 1 if failures else 0
 
 
-def run_stop(run: str | Path) -> int:
-    """`pai stop <run>` - ask the acquisition writing this run to stop cleanly.
-
-    Works from any machine that can see the run folder (the acquisition polls
-    for the marker), which is how gamma2 stops a run inside the VM.
-    """
-    from gpu_power_monitor.live_buffer import read_live_status
+def run_stop(run: str | Path, timeout_sec: float = 75.0) -> int:
+    """Request stop and wait for evidence, never promise unconfirmed cleanup."""
+    from gpu_power_monitor.config import load_config
+    from gpu_power_monitor.manifest import load_manifest
+    from gpu_power_monitor.supervisor import TERMINAL
     from gpu_power_monitor.utils import request_stop
-
+    from gpu_power_monitor import vm
     run_dir = _resolve_run(run)
     if not run_dir.is_dir():
         print(f"[ERROR] No such run: {run}")
         return 1
-    state = read_live_status(run_dir, stale_after_sec=5.0).state
-    if state in ("COMPLETE", "ERROR"):
-        print(f"[INFO] '{run_dir.name}' is not running (state {state}) - nothing to stop.")
-        return 0
+    cfg = load_config(_default_config())
+    deadline = time.monotonic() + timeout_sec
+    if cfg.vm.enabled:
+        try:
+            state = vm.control(cfg.vm, run_dir.name, "stop")
+            while time.monotonic() < deadline:
+                phase = state.get("state")
+                if phase in TERMINAL:
+                    if not state.get("worker_stopped"):
+                        print(f"[ERROR] VM reports {state.get('reason')}; acquisition stop is unconfirmed.")
+                        return 1
+                    if phase == "completed" and state.get("storage_status") == "verified":
+                        print("[INFO] Stopped and finalized (completed).")
+                        return 0
+                    print(f"[WARN] Stopped with incomplete data ({phase}; {state.get('reason')}).")
+                    return 1
+                if phase == "unknown":
+                    break
+                if state.get("worker_stopped"):
+                    print("[WARN] Acquisition stopped with incomplete data; export/finalization still pending.")
+                    return 1
+                time.sleep(1)
+                state = vm.control(cfg.vm, run_dir.name, "status")
+        except vm.VmUnavailable as exc:
+            print(f"[WARN] {exc}")
+        print("[WARN] VM stop unconfirmed; trying shared STOP marker (legacy fallback).")
     request_stop(run_dir)
-    print(f"[INFO] Stop requested for '{run_dir.name}'. The run finalizes within a few seconds; "
-          f'check with: pai runs list')
-    return 0
+    while time.monotonic() < deadline:
+        try:
+            status = load_manifest(run_dir).get("status")
+            if status in TERMINAL:
+                print(f"[INFO] Run finalized ({status}).")
+                return 0 if status == "completed" else 1
+        except (OSError, ValueError):
+            pass
+        time.sleep(.5)
+    print("[ERROR] Stop timed out; VM process exit is unconfirmed. Do not start another run.")
+    return 1
 
 
 def run_fetch(run: str | Path, *, config_path: Path | None = None) -> int:
@@ -409,6 +437,20 @@ def run_runs(action: str, run: str | None) -> int:
         print(f"[ERROR] No such run: {run}")
         return 1
     try:
+        if action == "recover":
+            from gpu_power_monitor import vm
+            from gpu_power_monitor.config import load_config
+            cfg = load_config(_default_config())
+            if not cfg.vm.enabled:
+                print("[ERROR] Recovery requires VM process verification.")
+                return 1
+            try:
+                state = vm.control(cfg.vm, run_dir.name, "recover")
+            except vm.VmUnavailable as exc:
+                print(f"[ERROR] Recovery unconfirmed: {exc}")
+                return 1
+            print(f"[INFO] Recovery result: {state}")
+            return 0 if state.get("state") == "interrupted" else 1
         if action == "promote":
             set_run_kind(run_dir, "archive")
             run_dir = _relocate_run(run_dir, test=False)
@@ -481,6 +523,7 @@ def run_hardware(
     port: int = 8000,
     config_path: Path | None = None,
     duration_sec: float | None = None,
+    workload_seconds: float | None = None,
     run_id: str | None = None,
     operator: str | None = None,
     machine: str | None = None,
@@ -488,6 +531,11 @@ def run_hardware(
 ) -> int:
     import dataclasses
     import threading
+    import math
+    for value in (duration_sec, workload_seconds):
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            print("[ERROR] Durations must be finite and positive.")
+            return 2
 
     from gpu_power_monitor.acquisition import acquire, with_measurement_name
     from gpu_power_monitor.config import load_config, select_gpus
@@ -540,7 +588,8 @@ def run_hardware(
         return _run_hardware_in_vm(
             config, display=display, test=test, gpus=gpus, port=port,
             run_id=run_id, explicit_dir=explicit_dir, workload=workload,
-            config_name=_vm_config_name(config_path),
+            config_name=_vm_config_name(config_path), duration_sec=duration_sec,
+            workload_seconds=workload_seconds,
         )
 
     if not display and not workload:
@@ -609,7 +658,7 @@ def _display_cfg(config) -> dict:
     }
 
 
-def _run_workload(workload: list[str], run_dir: Path | None = None, abort_if=None) -> int:
+def _run_workload(workload: list[str], run_dir: Path | None = None, abort_if=None, timeout_sec=None) -> int:
     """Run the bracketed workload command; its exit code is reported, not raised.
 
     The workload sees ``PAI_RUN_DIR`` / ``PAI_RUN_ID`` so it can write its own
@@ -627,26 +676,43 @@ def _run_workload(workload: list[str], run_dir: Path | None = None, abort_if=Non
         env["PAI_RUN_ID"] = run_dir.name
     print(f"[INFO] Running workload: {' '.join(workload)}")
     try:
-        proc = subprocess.Popen(workload, env=env)
+        proc = subprocess.Popen(workload, env=env, start_new_session=True)
     except FileNotFoundError:
         print(f"[ERROR] Workload command not found: {workload[0]}")
         return 127
 
     def _end(signal_name: str) -> None:
-        proc.terminate()
+        if os.name != "nt":
+            import signal
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            proc.terminate()
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            if os.name != "nt":
+                import signal
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                proc.kill()
+            proc.wait(timeout=10)
         print(f"[INFO] Workload {signal_name}.")
 
+    started = time.monotonic()
     try:
         while True:
             code = proc.poll()
             if code is not None:
                 break
             reason = abort_if() if abort_if is not None else None
+            if timeout_sec is not None and time.monotonic()-started >= timeout_sec:
+                reason = "Workload exceeded its execution/drain deadline"
             if reason:
                 print(f"[ERROR] {reason}")
                 _end("stopped - the measurement ended")
@@ -694,7 +760,8 @@ def _vm_config_name(config_path: Path | None) -> str | None:
 def _run_hardware_in_vm(
     config, *, display: bool, test: bool, gpus: str | None, port: int,
     run_id: str | None, explicit_dir: Path | None, workload: list[str] | None,
-    config_name: str | None = None,
+    config_name: str | None = None, duration_sec: float | None = None,
+    workload_seconds: float | None = None,
 ) -> int:
     """`pai hardware` on gamma2: start the run inside the VM, watch it from here."""
     import datetime as dt
@@ -715,13 +782,20 @@ def _run_hardware_in_vm(
         proc = vm.start_acquisition(
             config.vm, run_id=run_dir.name, operator=config.operator, machine=config.machine,
             test=test, gpus=gpus, log_path=log_path, config_name=config_name,
+            duration_sec=duration_sec, maximum_sec=(workload_seconds or duration_sec or 86400) + 600,
         )
         print(f"[INFO] Starting acquisition in VM {config.vm.name or config.vm.host} ...")
         vm.wait_for_start(run_dir, proc, config.vm.start_timeout_sec, log_path)
     except vm.VmUnavailable as exc:
         print(f"[ERROR] {exc}")
+        if 'proc' in locals() and getattr(proc, "lease", None):
+            try:
+                vm.control(config.vm, run_dir.name, "stop", "startup_failed")
+            except vm.VmUnavailable:
+                pass
+            proc.lease.close()
         return 1
-    print(f"[INFO] Run directory: {run_dir}")
+    print(f"[INFO] Run directory: {run_dir}", flush=True)
 
     httpd = None
     if display:
@@ -735,22 +809,41 @@ def _run_hardware_in_vm(
 
     status = "running"
     workload_code = 0
+    lease = getattr(proc, "lease", None)
+    def stop_vm(reason):
+        if lease:
+            try:
+                vm.control(config.vm, run_dir.name, "stop", reason)
+            except vm.VmUnavailable as exc:
+                print(f"[WARN] Stop unconfirmed: {exc}; supervisor lease will expire.")
+        else:
+            request_stop(run_dir)
+    def failure():
+        if lease and lease.failure():
+            return lease.failure()
+        return _acquisition_failed(run_dir)
     try:
         if workload:
-            workload_code = _run_workload(workload, run_dir, abort_if=lambda: _acquisition_failed(run_dir))
+            workload_code = _run_workload(workload, run_dir, abort_if=failure,
+                                          timeout_sec=(workload_seconds + 120) if workload_seconds else None)
             print("[INFO] Stopping acquisition in the VM ...")
-            request_stop(run_dir)
-        status = vm.wait_for_end(run_dir, proc)
+            stop_vm("workload_completed" if workload_code == 0 else "workload_failed")
+        status = vm.wait_for_end(run_dir, proc, timeout_sec=(960 if workload else (duration_sec or 86400) + 960))
     except KeyboardInterrupt:
         workload_code = 130 if workload else 0
         print("\n[INFO] Stopping acquisition in the VM (this takes a few seconds) ...")
-        request_stop(run_dir)
-        status = vm.wait_for_end(run_dir, proc, timeout_sec=180.0)
+        stop_vm("user_stop")
+        status = vm.wait_for_end(run_dir, proc, timeout_sec=960)
     finally:
+        if lease:
+            lease.close()
         if httpd is not None:
             from gpu_power_monitor.web.server import stop_server
 
             stop_server(httpd)
+    if status in {"running", "error", "interrupted"} and lease:
+        print(f"[ERROR] VM supervision ended: {lease.state}")
+        return 1
     if status == "running":
         print(f"[WARN] The run did not finalize; check {log_path} and `pai runs list`.")
         return 1
@@ -770,11 +863,27 @@ def _finish_hardware_run(run_dir: Path, config, workload_code: int = 0) -> int:
         print(f"[ERROR] Acquisition did not complete: {run_dir} "
               f"(status {data.get('status')}; {data.get('error', 'see VM log')})")
         return 1
+    if data.get("supervision") and data.get("storage", {}).get("status") != "verified":
+        print("[ERROR] Measurement export is unverified; run is not successful.")
+        return 1
     if workload_code:
         update_manifest(run_dir, status="error", archive_status="archive_error",
                         workload_exit_code=workload_code, error=f"Workload exited with code {workload_code}")
         print(f"[ERROR] Workload failed with exit {workload_code}; run is not successful: {run_dir}")
         return workload_code if workload_code > 0 else 1
+    from gpu_power_monitor.manifest import load_workload_meta, build_file_inventory
+    files = [item for item in data.get("files", []) if not item["path"].startswith("workload/")]
+    try:
+        workload_dir = run_dir / "workload"
+        if workload_dir.is_dir():
+            for item in build_file_inventory(workload_dir, deadline=time.monotonic()+300):
+                files.append(dict(item, path="workload/" + item["path"]))
+    except (OSError, ValueError) as exc:
+        update_manifest(run_dir, status="error", archive_status="archive_error", error=str(exc))
+        print(f"[ERROR] Workload file verification failed: {exc}")
+        return 1
+    update_manifest(run_dir, acquisition_status="completed", workload_status="completed",
+                    workload=load_workload_meta(run_dir), files=files)
     print(f"[INFO] Completed run: {run_dir} (status completed)")
     _auto_push(run_dir, config)
     return 0
@@ -839,7 +948,18 @@ def _archive_label(run: Path) -> str:
         return "no manifest"
     is_test = data.get("run_kind", "archive") == "test"
     if data.get("status") == "running":
+        from gpu_power_monitor.supervisor import read_json
+        supervision = read_json(run / "supervisor_status.json")
+        if time.time()-supervision.get("generated_at_epoch", 0) < 60:
+            phase = supervision.get("state")
+            if phase in {"starting", "stopping", "finalizing", "exporting"}:
+                return f"run {phase}"
+        from gpu_power_monitor.live_buffer import read_live_status
+        if read_live_status(run, stale_after_sec=60).state != "LIVE":
+            return "status stale; VM verification needed"
         return "test run in progress" if is_test else "run in progress"
+    if data.get("status") == "interrupted":
+        return "run interrupted"
     if data.get("status") == "error":
         return "run errored"
     if is_test:
@@ -1089,7 +1209,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hw.add_argument("--port", type=int, default=8000, help="Dashboard port (with --display).")
     p_hw.add_argument("--config", help="Config YAML (default: configs/default.yaml).")
-    p_hw.add_argument("--duration-sec", type=float, help="Optional finite duration for smoke tests.")
+    p_hw.add_argument("--duration-sec", type=float, help="Finite acquisition duration, including VM mode.")
+    p_hw.add_argument("--workload-seconds", type=float, help="Expected workload window; drain capped at 120 seconds.")
     p_hw.add_argument(
         "--run-id",
         help="Exact run folder name to create (no timestamp appended); refused if it exists. "
@@ -1142,7 +1263,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p_runs = sub.add_parser("runs", help="List runs, or manage test runs vs archive-bound runs.")
-    p_runs.add_argument("action", choices=["list", "promote", "demote", "delete"])
+    p_runs.add_argument("action", choices=["list", "promote", "demote", "delete", "recover"])
     p_runs.add_argument("run", nargs="?", help="Run directory or name (not needed for list).")
 
     p_fetch = sub.add_parser("fetch", help="Pull a run's NVML files from gamma (retry).")
@@ -1159,6 +1280,14 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    import signal
+    import threading
+    if threading.current_thread() is threading.main_thread():
+        def interrupted(signum, frame):
+            raise KeyboardInterrupt
+        for name in ("SIGTERM", "SIGHUP"):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), interrupted)
 
     if args.command == "devices":
         return run_devices()
@@ -1175,6 +1304,7 @@ def main(argv: list[str] | None = None) -> int:
             port=args.port,
             config_path=Path(args.config) if args.config else None,
             duration_sec=args.duration_sec,
+            workload_seconds=args.workload_seconds,
             run_id=args.run_id,
             operator=args.operator,
             machine=args.machine,

@@ -14,6 +14,10 @@ Nothing here is used unless `vm.*` is configured (PAI_VM_* in .env).
 from __future__ import annotations
 
 import subprocess
+import base64
+import json
+import threading
+import sys
 import time
 from pathlib import Path
 
@@ -82,52 +86,96 @@ def run_pai(cfg: VmConfig, args: list[str], timeout: float = 60.0) -> subprocess
         raise VmUnavailable(f"`pai {' '.join(args)}` in the VM did not answer within {timeout:.0f}s") from exc
 
 
-def start_acquisition(
-    cfg: VmConfig,
-    *,
-    run_id: str,
-    operator: str,
-    machine: str,
-    test: bool,
-    gpus: str | None,
-    log_path: Path,
-    config_name: str | None = None,
-) -> subprocess.Popen:
-    """Launch `pai hardware --run-id <run_id>` in the VM, detached.
+def _supervisor_command(cfg: VmConfig, action: str, payload: dict) -> str:
+    # Encoded PowerShell avoids both Linux-shell and Windows-shell interpolation.
+    python = cfg.pai.replace("/", "\\").rsplit("\\", 1)[0] + "\\python.exe"
+    encoded = base64.b64encode(json.dumps(payload).encode()).decode()
+    def ps(value):
+        return "'" + value.replace("'", "''") + "'"
+    command = (f"Set-Location -LiteralPath {ps(vm_repo_root(cfg))}; "
+               f"& {ps(python)} -u -m gpu_power_monitor.supervisor {action} {encoded}; exit $LASTEXITCODE")
+    return "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + base64.b64encode(command.encode("utf-16le")).decode()
 
-    The SSH session stays open for the life of the run (Windows OpenSSH ends
-    the remote process when the session drops, so it must outlive this
-    process: new session, no controlling terminal). Output goes to log_path.
-    """
-    host = resolve_host(cfg)
-    parts = [cfg.pai, "hardware", "--run-id", _quote(run_id)]
-    if operator:
-        parts += ["--operator", _quote(operator)]
-    if machine:
-        parts += ["--machine", _quote(machine)]
-    if test:
-        parts.append("--test")
-    if gpus:
-        parts += ["--gpus", _quote(gpus)]
+
+def control(cfg: VmConfig, run_id: str, action: str, reason: str = "user_stop") -> dict:
+    command = _supervisor_command(cfg, "control", {"run_id": run_id, "action": action, "reason": reason})
+    try:
+        result = subprocess.run(_ssh(cfg, resolve_host(cfg)) + [command], capture_output=True,
+                                text=True, timeout=12)
+        if result.returncode:
+            raise VmUnavailable(result.stderr.strip() or "VM control failed")
+        return json.loads(result.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError, OSError) as exc:
+        raise VmUnavailable(f"VM control unavailable: {exc}") from exc
+
+
+class ControllerLease:
+    def __init__(self, cfg, run_id):
+        self.cfg, self.run_id = cfg, run_id
+        self.state = {"state": "starting"}
+        self.last_contact = time.monotonic()
+        self.closed = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while not self.closed.is_set():
+            try:
+                state = control(self.cfg, self.run_id, "heartbeat")
+                if state.get("state") != "unknown":
+                    self.state = state
+                    self.last_contact = time.monotonic()
+            except VmUnavailable:
+                pass
+            self.closed.wait(5)
+
+    def failure(self):
+        state = self.state.get("state")
+        if state in {"error", "interrupted", "stopping"}:
+            return f"VM acquisition {state}: {self.state.get('reason')}"
+        if time.monotonic() - self.last_contact > 60:
+            return "VM control connection lost; acquisition stop unconfirmed"
+        return None
+
+    def close(self):
+        self.closed.set()
+        self.thread.join(timeout=13)
+
+
+def start_acquisition(
+    cfg: VmConfig, *, run_id: str, operator: str, machine: str, test: bool,
+    gpus: str | None, log_path: Path, config_name: str | None = None,
+    duration_sec: float | None = None, maximum_sec: float = 87000,
+) -> subprocess.Popen:
+    """Launch the Windows-local supervisor, not an unbounded DAQ process."""
+    spec = dict(run_id=run_id, operator=operator, machine=machine, test=test, gpus=gpus,
+                duration_sec=duration_sec, maximum_sec=maximum_sec)
     if config_name:
-        parts += ["--config", _quote(vm_config_path(cfg, config_name))]
+        spec["config"] = vm_config_path(cfg, config_name)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log = open(log_path, "ab")
-    return subprocess.Popen(
-        _ssh(cfg, host) + [" ".join(parts)],
-        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen(_ssh(cfg, resolve_host(cfg)) + [_supervisor_command(cfg, "spawn", spec)],
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    proc.lease = ControllerLease(cfg, run_id)
+    return proc
 
 
 def wait_for_start(run_dir: Path, proc: subprocess.Popen, timeout_sec: float, log_path: Path) -> None:
     """Block until the VM has created the run's manifest (or the SSH died)."""
-    deadline = time.time() + timeout_sec
+    deadline = time.monotonic() + timeout_sec
     manifest = Path(run_dir) / "manifest.json"
-    while time.time() < deadline:
-        if manifest.exists():
+    while time.monotonic() < deadline:
+        lease = getattr(proc, "lease", None)
+        if lease is not None:
+            if lease.failure():
+                raise VmUnavailable(lease.failure())
+            if lease.state.get("state") == "ready":
+                Path(run_dir).mkdir(parents=True, exist_ok=True)
+                return
+        elif manifest.exists():
             return
-        if proc.poll() is not None:
+        if proc.poll() is not None and (lease is None or proc.returncode != 0):
             raise VmUnavailable(
                 f"acquisition in the VM exited before starting (code {proc.returncode}); "
                 f"see {log_path}:\n{_tail(log_path)}"
@@ -151,16 +199,21 @@ def wait_for_end(run_dir: Path, proc: subprocess.Popen | None = None, timeout_se
     Returns the final status. Callers handle KeyboardInterrupt themselves (by
     requesting a stop and calling this again with a timeout).
     """
-    deadline = None if timeout_sec is None else time.time() + timeout_sec
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
     while True:
+        lease = getattr(proc, "lease", None)
+        if lease is not None:
+            state = lease.state.get("state")
+            if state in {"completed", "interrupted", "error"}:
+                return state
         status = run_status(run_dir)
-        if status != "running":
+        if lease is None and status != "running":
             return status
-        if proc is not None and proc.poll() is not None:
+        if lease is None and proc is not None and proc.poll() is not None:
             # Give the share a moment to show the final manifest write.
             time.sleep(2.0)
             return run_status(run_dir)
-        if deadline is not None and time.time() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             return status
         time.sleep(1.0)
 
