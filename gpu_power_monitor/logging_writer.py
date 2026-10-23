@@ -11,6 +11,7 @@ import numpy as np
 
 from .processing import ProcessedBlock
 from .utils import fmt_hhmmss_ms, rename_with_fallback
+from .chunks import begin_publication, publish, digest, validate_pair, logical_name, ChunkIntegrityError
 
 
 def csv_header(labels: list[str]) -> list[str]:
@@ -42,6 +43,8 @@ class ChunkWriter:
         if file_format != "csv":
             raise NotImplementedError("Only CSV writing is implemented")
         self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        begin_publication(self.out_dir)
         self.prefix = prefix
         self.labels = list(labels)
         self.header = csv_header(self.labels)
@@ -100,7 +103,7 @@ class ChunkWriter:
                 raise TimeoutError("Compression did not finish before shutdown deadline")
         if self.error is not None:
             raise RuntimeError(f"CSV writer failed: {self.error}") from self.error
-        return list(self.closed_paths)
+        return sorted(self.closed_paths, key=logical_name)
 
     def statistics(self) -> dict:
         return {"sample_count": self.finite_samples,
@@ -227,35 +230,58 @@ class ChunkWriter:
             gz_path = final_path.with_name(final_path.name + ".gz")
             def compress_chunk():
                 try:
-                    _gzip_chunk(final_path, gz_path)
+                    canonical, notices, source_digest = _gzip_chunk(final_path, gz_path)
+                    publish(canonical, notices, source_digest=source_digest)
+                    self.closed_paths.append(canonical)
+                    for notice in notices:
+                        print(f"[WARN] {final_path.name}: {notice}", flush=True)
                 except BaseException as exc:
                     self.error = exc
             t = threading.Thread(target=compress_chunk, daemon=True)
             t.start()
             self._compress_threads.append(t)
             self._compress_threads = [x for x in self._compress_threads if x.is_alive() or x is t]
-            self.closed_paths.append(gz_path)
         else:
+            publish(final_path, [], source_digest=digest(final_path))
             self.closed_paths.append(final_path)
         self.tmp_path = None
         self.chunk_start_wall = None
 
 
-def _gzip_chunk(src: Path, dst: Path) -> None:
-    """Compress a closed chunk in place: write dst, then remove src. A failure
-    leaves the plain CSV, so data is never lost to a compression problem."""
+def _gzip_chunk(src: Path, dst: Path) -> tuple[Path, list[str], str]:
+    """Settle representation before publishing; cleanup is never a write failure."""
     import gzip
     import shutil
-
+    notices = []
+    source_digest = digest(src)
     tmp = dst.with_name(dst.name + ".tmp")
     try:
         with open(src, "rb") as fin, gzip.open(tmp, "wb", compresslevel=4) as fout:
             shutil.copyfileobj(fin, fout, 1 << 20)
+        if not validate_pair(src, tmp):
+            raise OSError("Compressed file failed gzip validation")
         rename_with_fallback(tmp, dst)
-        src.unlink()
-    except OSError:
+        # A rename fallback may have copied bytes. Verify the installed file too.
+        if not validate_pair(src, dst):
+            raise OSError("Installed gzip failed validation")
+    except (OSError, EOFError) as exc:
+        if digest(src) != source_digest:
+            raise ChunkIntegrityError(f"Original CSV changed during compression: {src.name}") from exc
         try:
-            tmp.unlink()
+            tmp.unlink(missing_ok=True)
         except OSError:
             pass
-        raise
+        notices.append(f"compression_failed; original CSV retained: {exc}")
+        return src, notices, source_digest
+    for attempt in range(5):
+        try:
+            src.unlink()
+            break
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            if attempt == 4:
+                notices.append(f"cleanup_pending; verified gzip published, redundant CSV retained: {exc}")
+            else:
+                time.sleep(.05)
+    return dst, notices, source_digest

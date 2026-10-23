@@ -152,12 +152,9 @@ CHUNK_SUFFIXES = (".csv", ".csv.gz")
 
 def chunk_paths(run_dir) -> list:
     """The run's data chunks in time order, plain or gzipped (never PENDING)."""
-    from pathlib import Path as _P
+    from .chunks import canonical_chunks
 
-    run_dir = _P(run_dir)
-    paths = [p for p in run_dir.iterdir()
-             if p.is_file() and p.name.endswith(CHUNK_SUFFIXES) and "_to_PENDING" not in p.name]
-    return sorted(paths, key=lambda p: p.name[: -len(".gz")] if p.name.endswith(".gz") else p.name)
+    return canonical_chunks(Path(run_dir))
 
 
 def open_chunk(path, mode: str = "rt"):

@@ -21,7 +21,7 @@ from .config import AcquisitionConfig
 from .daq import NIDaqSource, SimulatedDaqSource
 from .live_buffer import LiveBuffer
 from .logging_writer import ChunkWriter
-from .manifest import create_manifest, finalize_manifest, update_manifest
+from .manifest import create_manifest, finalize_manifest, update_manifest, load_manifest
 from .processing import PowerProcessor
 from .remote import NvmlLogger, remote_unready_reason
 from .utils import runs_root, stop_file, unique_run_dir
@@ -47,6 +47,7 @@ def acquire(
     stop_event: threading.Event | None = None,
     print_fn: Callable[[str], None] = print,
     progress_path: Path | None = None,
+    run_identity: str | None = None,
 ) -> Path:
     if run_dir is None:
         run_dir = unique_run_dir(
@@ -54,7 +55,10 @@ def acquire(
         )
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    identity = run_identity or run_dir.name
     create_manifest(run_dir, config)
+    if run_identity:
+        update_manifest(run_dir, run_id=identity)
     print_fn(f"[INFO] Run directory: {run_dir}")
 
     gpus = config.channels.gpus
@@ -104,12 +108,12 @@ def acquire(
     elif (reason := remote_unready_reason(config.remote)) is not None:
         print_fn(f"[INFO] NVML logging on gamma skipped: {reason}")
     else:
-        nvml = NvmlLogger(config.remote, run_dir.name)
+        nvml = NvmlLogger(config.remote, identity)
         try:
             nvml.start()
             print_fn(
                 f"[INFO] NVML logger running on {config.remote.host} "
-                f"(~{run_dir.name}/nvml.csv every {config.remote.nvml_interval_ms} ms)"
+                f"(~{identity}/nvml.csv every {config.remote.nvml_interval_ms} ms)"
             )
         except Exception as exc:
             print_fn(f"[WARN] Could not start the NVML logger on gamma: {exc}")
@@ -203,7 +207,9 @@ def acquire(
             print_fn(f"[WARN] Could not remove {stop_marker.name}: {exc}")
         if cleanup_error is not None:
             failed = True
-            update_manifest(run_dir, status="error", archive_status="archive_error", error=str(cleanup_error))
+            original_error = load_manifest(run_dir).get("error")
+            update_manifest(run_dir, status="error", archive_status="archive_error",
+                            error=original_error or str(cleanup_error), cleanup_error=str(cleanup_error))
             live.mark_state("ERROR")
             raise cleanup_error
         if not failed:

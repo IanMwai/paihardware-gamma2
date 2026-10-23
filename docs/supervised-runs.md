@@ -118,3 +118,74 @@ requires manual investigation rather than guessing that the DAQ is free.
 Do not use a full-rate production trace as the first unattended test. Its file
 parsing and inference backlog add setup time; a bounded deadline may reject
 that run rather than letting an overloaded replay continue indefinitely.
+
+## Compression and failed-run reconciliation
+
+The writer now publishes one settled representation of each chunk through a
+local `.chunks` registry. With compression enabled, the exporter never reads
+the intermediate CSV while gzip is still working. It starts only after a
+verified gzip, or an intact CSV fallback, has been published. The registry is
+control metadata and is not included in the dataset inventory.
+
+A Windows sharing violation while deleting a redundant CSV is recorded as
+`cleanup_pending`; it does not fail acquisition when a verified gzip exists.
+Compression failures retain the original CSV and publish it with a warning.
+Unrecoverable writes and conflicting CSV/gzip contents remain failures.
+Readers validate duplicate representations and count a logical chunk once.
+The terminal exporter reloads its manifest after the EXPORT marker, preserves
+the real acquisition exception, and will not verify a still-running manifest.
+NVML directories use the actual run ID rather than the spool subfolder `data`.
+
+For the failed three-hour run, first update the hardware package on Linux and
+Windows. Keep both the Linux copy and the Windows spool. In Administrator
+PowerShell from `C:\pai\paihardware-gamma2`, inspect without changing files:
+
+```powershell
+.\.venv\Scripts\python.exe -m gpu_power_monitor.reconcile g2_ramp_qwen7b_steady_3h_20261023_202815
+```
+
+Inspection checks process ownership, validates CSV/gzip pairs, verifies the
+canonical files against the Linux copy, and reports the original exception.
+If it fails, preserve both copies and investigate the named file or process.
+Do not manually remove duplicates or mark the run completed.
+
+To apply the verified metadata reconciliation:
+
+```powershell
+.\.venv\Scripts\python.exe -m gpu_power_monitor.reconcile g2_ramp_qwen7b_steady_3h_20261023_202815 --apply
+```
+
+Apply checks process inactivity again, backs up existing metadata with a unique
+`.before-reconcile-...` suffix, and preserves all data files. It retains error
+or interrupted status and disables automatic archiving. When duplicate pairs
+exist, previously calculated statistics are cleared rather than risking a
+double count; the old values remain in the metadata backup. This command does
+not re-run the workload or turn 54 minutes into a successful three-hour run.
+The tool refuses to reconcile a completed run.
+
+Back on Linux, `pai runs list` should show the failed run as errored rather
+than stale. The research campaign remains separate from this repair.
+
+### Validation on Windows and Gamma 2
+
+The offline suite contains injected sharing violations and a Windows-only
+native lock regression. If pytest is available in the Windows environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests/test_chunk_handoff.py tests/test_reconcile.py
+```
+
+Before another long run, collect a watched five-minute ramp to exercise several
+one-minute chunk rotations, then repeat the one-hour stage. These are live
+hardware validation steps; passing simulated tests alone does not establish
+DAQ/Windows reliability.
+
+```bash
+pai-campaign run /opt/pai/pai-workloads/campaigns/gamma2-ramp.yaml --stage 5m --rerun
+pai-campaign run /opt/pai/pai-workloads/campaigns/gamma2-ramp.yaml --stage 1h --rerun
+```
+
+Run these sequentially and review each result before the next. The commands
+above run in the foreground, so keep the SSH session open. Confirm distinct
+NVML run directories, completed acquisition, verified export, no writer errors,
+and no duplicated logical chunks before retrying three hours under systemd.

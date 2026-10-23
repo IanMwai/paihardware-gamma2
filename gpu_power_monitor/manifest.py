@@ -91,6 +91,9 @@ def finalize_manifest(run_dir: Path, end_time_s: float, *, stats: dict | None = 
     data = load_manifest(run_dir)
     files = build_file_inventory(run_dir)
     stats = compute_run_stats(run_dir) if stats is None else stats
+    from .chunks import ready_records
+    notices = [dict(chunk=r["logical_name"], message=w) for r in ready_records(run_dir) for w in r.get("warnings", [])]
+    data["storage_warnings"] = notices
     workload = load_workload_meta(run_dir)
     if workload is not None:
         data["workload"] = workload
@@ -125,18 +128,16 @@ def refresh_file_inventory(run_dir: Path) -> dict[str, Any]:
 
 def build_file_inventory(run_dir: Path, *, deadline: float | None = None) -> list[dict[str, Any]]:
     run_dir = Path(run_dir)
+    from .chunks import inventory_paths, digest, is_chunk
     files = []
-    for path in sorted(run_dir.rglob("*")):
-        if not path.is_file():
-            continue
+    for path in inventory_paths(run_dir):
         rel = path.relative_to(run_dir).as_posix()
-        if rel in {MANIFEST_NAME, "latest.npz", "latest_status.json", STOP_FILE_NAME}:
-            continue
         files.append(
             {
                 "path": rel,
                 "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path, deadline=deadline),
+                "sha256": (digest(path) if deadline is None and path.parent == run_dir and is_chunk(path)
+                           else sha256_file(path, deadline=deadline)),
             }
         )
     return files

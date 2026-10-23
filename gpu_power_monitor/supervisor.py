@@ -118,7 +118,7 @@ def worker(spec: dict, session: Path) -> int:
                               test_run=spec.get("test", False),
                               storage=dataclasses.replace(cfg.storage, output_root=session))
     acquire(cfg, simulate=spec.get("simulate", False), duration_sec=spec.get("duration_sec"),
-            run_dir=session / "data", progress_path=session / "progress.json")
+            run_dir=session / "data", progress_path=session / "progress.json", run_identity=spec["run_id"])
     return 0
 
 
@@ -138,7 +138,7 @@ def copy_verified(src: Path, dest: Path, expected: str | None = None) -> str:
 
 def export(session: Path, destination: Path) -> int:
     """Only this expendable process touches the network share."""
-    from .manifest import sha256_file
+    from .manifest import build_file_inventory
     from .utils import chunk_paths
     data = session / "data"
     copied = read_json(session / "copy-index.json")
@@ -181,23 +181,21 @@ def export(session: Path, destination: Path) -> int:
                     shutil.copyfile(source, destination / name)
             terminal = (session / "EXPORT").exists()
             if terminal:
-                for name in copied:
-                    if not (data / name).exists():
-                        (destination / name).unlink(missing_ok=True)
-                for item in manifest.get("files", []):
-                    source = data / item["path"]
-                    sync(source, item["sha256"])
-                # Preserve partial/PENDING data on failed runs as evidence too.
-                for source in data.rglob("*"):
-                    if source.is_file() and source.name != "manifest.json":
-                        rel = source.relative_to(data)
-                        sync(source)
+                # The marker is the commit boundary. A manifest read before a
+                # long file copy can still say running when the marker appears.
+                manifest = read_json(data / "manifest.json")
+                if manifest.get("status") not in TERMINAL:
+                    raise RuntimeError("Export-ready marker has no terminal manifest")
+                files = build_file_inventory(data)
+                expected = {item["path"]: item["sha256"] for item in manifest.get("files", [])}
+                for item in files:
+                    if item["path"] in expected and expected[item["path"]] != item["sha256"]:
+                        raise RuntimeError(f"Final source checksum mismatch: {item['path']}")
+                    sync(data / item["path"], item["sha256"])
+                # Never delete surviving originals on either machine. Only
+                # canonical representations belong to the dataset inventory.
+                manifest["files"] = files
                 manifest["storage"] = {"status": "verified", "local_spool": str(data)}
-                manifest["files"] = [
-                    {"path": p.relative_to(data).as_posix(), "size_bytes": p.stat().st_size,
-                     "sha256": sync(p)}
-                    for p in sorted(data.rglob("*")) if p.is_file() and p.name not in
-                    {"manifest.json", "latest.npz", "latest_status.json", "STOP"}]
             elif manifest:
                 manifest = dict(manifest, status="running", archive_status="local_only")
             if manifest:
@@ -268,14 +266,17 @@ def launch(spec: dict) -> int:
         shutil.copyfile(session / "worker.log", diagnostics / "worker.log")
         manifest = read_json(data / "manifest.json") or {"run_id": spec["run_id"], "run_kind": "test" if spec.get("test") else "archive"}
         reason = watch.reason or read_json(session / "stop.json").get("reason")
+        worker_error = manifest.get("error")
         successful = proc.returncode == 0 and manifest.get("status") == "completed" and reason in (None, "workload_completed") and not forced
         if not successful:
             state = "interrupted" if reason in {"user_stop", "controller_lost"} else "error"
             manifest.update(status=state, archive_status="archive_error", ended_at=utc_now_iso(),
-                            error=reason or "acquisition_failed")
+                            error=worker_error or reason or f"acquisition_failed (worker exit {proc.returncode})")
         if forced:
-            manifest["error"] = "shutdown_timeout"
-        manifest["supervision"] = {"forced": forced, "reason": reason, "worker_exit": proc.returncode,
+            manifest["error"] = worker_error or "shutdown_timeout"
+        failure_detail = manifest.get("error") if not successful else reason
+        manifest["supervision"] = {"forced": forced, "reason": failure_detail, "stop_reason": reason,
+                                    "worker_error": worker_error, "worker_exit": proc.returncode,
                                     "local_spool": str(data), "maximum_sec": maximum}
         manifest["acquisition_status"] = manifest["status"]
         manifest["workload_status"] = "completed" if reason == "workload_completed" else ("not_requested" if successful else "unconfirmed")
@@ -285,7 +286,7 @@ def launch(spec: dict) -> int:
                    state="COMPLETE" if successful else "ERROR", generated_at_epoch=time.time()))
         (session / "EXPORT").touch()
         write_json(session / "status.json", {"state": "exporting", "acquisition_status": manifest["status"],
-                   "reason": reason, "forced": forced, "worker_stopped": True})
+                   "reason": failure_detail, "forced": forced, "worker_stopped": True})
         deadline = time.monotonic() + EXPORT_SECONDS
         while transfer.poll() is None and time.monotonic() < deadline:
             time.sleep(.5)
@@ -294,7 +295,8 @@ def launch(spec: dict) -> int:
             kill_tree(transfer)
         final = manifest["status"] if verified else "error"
         write_json(session / "status.json", {"state": final, "acquisition_status": manifest["status"],
-                   "reason": reason if verified else "export_unverified", "forced": forced,
+                   "reason": failure_detail if verified else "export_unverified",
+                   "worker_error": worker_error, "forced": forced,
                    "worker_stopped": True, "storage_status": "verified" if verified else "unverified",
                    "local_spool": str(data)})
         return 0 if final == "completed" else 1
@@ -346,22 +348,27 @@ def windows_processes() -> list[dict]:
     return [processes] if isinstance(processes, dict) else processes
 
 
+def verify_inactive(session: Path) -> None:
+    """Refuse metadata repair while any recorded job process may still be alive."""
+    owner = read_json(session / "owner.json")
+    if not owner:
+        raise RuntimeError("recovery refused: missing process ownership record")
+    if any(pid_alive(owner.get(key)) for key in ("supervisor", "worker", "exporter")):
+        raise RuntimeError("recovery refused: supervisor, acquisition, or exporter still running")
+    if os.name == "nt":
+        for process in windows_processes():
+            command = process.get("CommandLine")
+            if not command or str(session).casefold() in command.casefold():
+                raise RuntimeError("recovery refused: live child or inaccessible process details")
+
+
 def recover(run_id: str) -> dict:
     """Explicit recovery never invents a successful completion."""
     from .config import load_config
     session = session_path(run_id)
     spec = read_json(session / "spec.json")
     if spec:
-        owner = read_json(session / "owner.json")
-        if not owner:
-            raise RuntimeError("recovery refused: missing process ownership record")
-        if any(pid_alive(owner.get(key)) for key in ("supervisor", "worker", "exporter")):
-            raise RuntimeError("recovery refused: supervisor, acquisition, or exporter still running")
-        if os.name == "nt":
-            for process in windows_processes():
-                command = process.get("CommandLine")
-                if not command or str(session).casefold() in command.casefold():
-                    raise RuntimeError("recovery refused: live child or inaccessible process details")
+        verify_inactive(session)
         path = session / "data"
     else:
         # Legacy runs have no local supervisor record. Query exact run-id
