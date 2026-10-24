@@ -189,3 +189,13 @@ Run these sequentially and review each result before the next. The commands
 above run in the foreground, so keep the SSH session open. Confirm distinct
 NVML run directories, completed acquisition, verified export, no writer errors,
 and no duplicated logical chunks before retrying three hours under systemd.
+
+## Research runs with selected telemetry
+
+`pai hardware --gpus GPU2 --nvml-gpus GPU-<verified-uuid> ...` selects the DAQ voltage/current pair and matching physical NVML device. The UUID-to-DAQ correspondence must be physically verified. `--nvml-gpus` requires one distinct device per selected DAQ pair. It is forwarded to the Windows worker, which starts a filtered NVML logger; missing, invalid, unselected or substantially incomplete telemetry fails the research run. Existing runs without this option retain their previous behavior.
+
+`configs/research.yaml` keeps unsmoothed power samples and the existing calibrated voltage/current values. It does not change `configs/default.yaml` or a running worker. Copy this config and the updated modules to Windows before using the research suite.
+
+`pai runs prune-spool RUN` asks the VM to reclaim only a completed run's local chunk files. It verifies inactive processes, matching local/Linux logical chunks, the Linux inventory checksums, and a verified Globus task before deleting anything. It retains Windows metadata and diagnostics, all Linux data, and every failed/interrupted run. It refuses pending transfers. The research campaign calls this for its own completed runs as archive verification becomes available; it never uses `pai archive cleanup` to delete Linux runs.
+
+For bounded writer backpressure, full-size acquisition blocks, serial compression, and the new recording diagnostics, see [Recording through brief writer stalls](writer-reliability.md). Deploy this fix before retrying the failed 12-hour ramp; it preserves the earlier failed run and does not certify its partial data as a complete experiment.

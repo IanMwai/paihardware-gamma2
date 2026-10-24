@@ -437,6 +437,15 @@ def run_runs(action: str, run: str | None) -> int:
         print(f"[ERROR] No such run: {run}")
         return 1
     try:
+        if action == "prune-spool":
+            from gpu_power_monitor import vm
+            from gpu_power_monitor.config import load_config
+            cfg = load_config(_default_config())
+            if not cfg.vm.enabled:
+                raise RuntimeError("Spool reclamation requires VM process verification")
+            state = vm.control(cfg.vm, run_dir.name, "prune-spool")
+            print(f"[INFO] Spool reclamation: {state}")
+            return 0 if state.get("state") == "pruned" else 1
         if action == "recover":
             from gpu_power_monitor import vm
             from gpu_power_monitor.config import load_config
@@ -520,6 +529,7 @@ def run_hardware(
     name: str | None = None,
     test: bool = False,
     gpus: str | None = None,
+    nvml_gpus: str | None = None,
     port: int = 8000,
     config_path: Path | None = None,
     duration_sec: float | None = None,
@@ -565,6 +575,15 @@ def run_hardware(
     except ValueError as exc:
         print(f"[ERROR] {exc}")
         return 1
+    if nvml_gpus:
+        import re
+        ids = tuple(nvml_gpus.split(","))
+        if len(ids) != len(config.channels.gpus) or len(set(ids)) != len(ids) or any(
+            not re.fullmatch(r"(?:[0-9]+|GPU-[A-Za-z0-9-]+)", x) for x in ids
+        ):
+            print("[ERROR] --nvml-gpus needs one distinct NVML index or UUID per DAQ GPU.")
+            return 2
+        config = dataclasses.replace(config, remote=dataclasses.replace(config.remote, gpu_ids=ids, required=True))
     if len(config.channels.gpus) < 4:
         print(f"[INFO] Measuring: {', '.join(config.channels.labels)}")
     if test:
@@ -783,9 +802,16 @@ def _run_hardware_in_vm(
             config.vm, run_id=run_dir.name, operator=config.operator, machine=config.machine,
             test=test, gpus=gpus, log_path=log_path, config_name=config_name,
             duration_sec=duration_sec, maximum_sec=(workload_seconds or duration_sec or 86400) + 600,
+            **({"nvml_gpus": list(config.remote.gpu_ids)} if config.remote.gpu_ids else {}),
         )
         print(f"[INFO] Starting acquisition in VM {config.vm.name or config.vm.host} ...")
         vm.wait_for_start(run_dir, proc, config.vm.start_timeout_sec, log_path)
+        if config.remote.gpu_ids:
+            scope = getattr(getattr(proc, "lease", None), "state", {}).get("progress", {})
+            if (scope.get("nvml_gpus") != list(config.remote.gpu_ids)
+                    or scope.get("daq_labels") != list(config.channels.labels)
+                    or scope.get("power_average_samples") != config.processing.power_average_samples):
+                raise vm.VmUnavailable("Windows measurement scope/config is not confirmed; update the VM before research collection")
     except vm.VmUnavailable as exc:
         print(f"[ERROR] {exc}")
         if 'proc' in locals() and getattr(proc, "lease", None):
@@ -1207,6 +1233,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Measure only these GPUs: labels or 1-based indices, comma-separated "
         '(e.g. "1", "GPU1,GPU3"). Default: all configured GPUs.',
     )
+    p_hw.add_argument("--nvml-gpus", help="Physical NVML indices or UUIDs matching --gpus; requires telemetry.")
     p_hw.add_argument("--port", type=int, default=8000, help="Dashboard port (with --display).")
     p_hw.add_argument("--config", help="Config YAML (default: configs/default.yaml).")
     p_hw.add_argument("--duration-sec", type=float, help="Finite acquisition duration, including VM mode.")
@@ -1263,7 +1290,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p_runs = sub.add_parser("runs", help="List runs, or manage test runs vs archive-bound runs.")
-    p_runs.add_argument("action", choices=["list", "promote", "demote", "delete", "recover"])
+    p_runs.add_argument("action", choices=["list", "promote", "demote", "delete", "recover", "prune-spool"])
     p_runs.add_argument("run", nargs="?", help="Run directory or name (not needed for list).")
 
     p_fetch = sub.add_parser("fetch", help="Pull a run's NVML files from gamma (retry).")
@@ -1301,6 +1328,7 @@ def main(argv: list[str] | None = None) -> int:
             name=args.name,
             test=args.test,
             gpus=args.gpus,
+            nvml_gpus=args.nvml_gpus,
             port=args.port,
             config_path=Path(args.config) if args.config else None,
             duration_sec=args.duration_sec,

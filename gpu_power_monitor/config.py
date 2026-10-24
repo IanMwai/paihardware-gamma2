@@ -180,6 +180,8 @@ class RemoteConfig:
     remote_run_root: str = "pai_runs"
     # nvidia-smi logging interval; NVML refreshes O(10 Hz), finer adds no info.
     nvml_interval_ms: int = 100
+    gpu_ids: tuple[str, ...] = ()  # Explicit physical NVML indices or UUIDs for this run.
+    required: bool = False  # Research runs require paired telemetry.
     connect_timeout_sec: float = 10.0
 
 
@@ -189,6 +191,8 @@ class LoggingConfig:
     file_prefix: str = "nidaq"
     format: str = "csv"
     queue_blocks: int = 200
+    enqueue_timeout_sec: float = 5.0
+    compression_queue_chunks: int = 2
     # gzip each chunk once it is closed (a background thread, so acquisition
     # never waits; CSVs of 10 kHz samples shrink 3-5x). Every reader (stats,
     # replay, dataset tools) accepts .csv and .csv.gz alike.

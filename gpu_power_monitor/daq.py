@@ -99,15 +99,24 @@ class NIDaqSource:
             return 0
         return int(self.task.in_stream.avail_samp_per_chan)
 
+    @property
+    def buffer_capacity_samples(self) -> int:
+        return int(max(self.chunk_size * 200, int(self.sample_rate_hz) * 60))
+
     def read(self, n_samples: int) -> tuple[list[list[float]], list[list[float]]]:
         if self.task is None:
             raise RuntimeError("DAQ task has not been started")
         raw = self.task.read(number_of_samples_per_channel=int(n_samples), timeout=0.0)
-        channels = ensure_channel_list(raw)
         expected = 2 * len(self.channels.gpus)
+        if int(n_samples) == 1 and isinstance(raw, list) and len(raw) == expected and all(np.isscalar(v) for v in raw):
+            channels = [[v] for v in raw]
+        else:
+            channels = ensure_channel_list(raw)
         if len(channels) < expected:
             raise RuntimeError(f"Expected {expected} channels from task.read(), got {len(channels)}")
-        n = min(len(ch) for ch in channels[:expected])
+        if len(channels) != expected or any(len(ch) != int(n_samples) for ch in channels):
+            raise RuntimeError("DAQ returned mismatched sample arrays; refusing to truncate data")
+        n = int(n_samples)
         voltages = [channels[2 * g][:n] for g in range(len(self.channels.gpus))]
         currents = [channels[2 * g + 1][:n] for g in range(len(self.channels.gpus))]
         return voltages, currents

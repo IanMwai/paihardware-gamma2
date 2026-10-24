@@ -42,7 +42,12 @@ logging:
   chunk_duration_sec: 60
   file_prefix: "nidaq"
   format: "csv"
+  # Full 1,000-sample blocks give about 20 seconds of queued samples at 10 kHz.
   queue_blocks: 200
+  # Brief queue pressure may recover; sustained overload still fails the run.
+  enqueue_timeout_sec: 5.0
+  # One compression worker, at most two waiting chunks; overflow stays CSV.
+  compression_queue_chunks: 2
   compress: true     # gzip finished chunks in the background (3-5x smaller)
 
 # The GPU workload machine ("gamma"). Credentials are machine-local: set

@@ -113,6 +113,9 @@ def worker(spec: dict, session: Path) -> int:
     from .config import load_config, select_gpus
     cfg = load_config(Path(spec["config"]) if spec.get("config") else Path(__file__).resolve().parents[1] / "configs" / "default.yaml")
     cfg = select_gpus(cfg, spec.get("gpus"))
+    if spec.get("nvml_gpus"):
+        cfg = dataclasses.replace(cfg, remote=dataclasses.replace(
+            cfg.remote, gpu_ids=tuple(spec["nvml_gpus"]), required=True))
     cfg = dataclasses.replace(cfg, measurement_name=spec["run_id"],
                               operator=spec.get("operator", ""), machine=spec.get("machine", ""),
                               test_run=spec.get("test", False),
@@ -209,11 +212,12 @@ def export(session: Path, destination: Path) -> int:
 
 
 def launch(spec: dict) -> int:
-    from .config import load_config
+    from .config import load_config, select_gpus
     session = session_path(spec["run_id"])
     session.mkdir(parents=True, exist_ok=False)
     write_json(session / "spec.json", spec)
     cfg = load_config(Path(spec["config"]) if spec.get("config") else Path(__file__).resolve().parents[1] / "configs" / "default.yaml")
+    cfg = select_gpus(cfg, spec.get("gpus"))
     maximum = float(spec.get("maximum_sec", 86400 + 600))
     if maximum <= 0 or not math.isfinite(maximum):
         raise ValueError("maximum_sec must be finite and positive")
@@ -409,10 +413,64 @@ def recover(run_id: str) -> dict:
     return {"state": "interrupted", "worker_stopped": True, "reason": manifest["error"]}
 
 
+def prune_spool(run_id: str) -> dict:
+    """Reclaim only inactive, completed chunks after export AND archive verification.
+
+    Keep manifests, diagnostics, telemetry, and the entire Linux dataset.
+    Failed/interrupted sessions are never eligible.
+    """
+    from .chunks import canonical_chunks
+    from .manifest import sha256_file as sha256
+    session = session_path(run_id)
+    verify_inactive(session)
+    spec = read_json(session / "spec.json")
+    data = session / "data"
+    local = read_json(data / "manifest.json")
+    from .config import load_config
+    cfg = load_config(Path(spec["config"]) if spec.get("config") else Path(__file__).resolve().parents[1]/"configs"/"default.yaml")
+    destination = Path(cfg.storage.output_root) / ("test" if spec.get("test") else "") / run_id
+    remote = read_json(destination / "manifest.json")
+    if (local.get("status") != "completed" or remote.get("status") != "completed"
+            or remote.get("storage", {}).get("status") != "verified"
+            or remote.get("archive_status") != "archived_verified"
+            or not remote.get("archive", {}).get("verified_at")
+            or not remote.get("archive", {}).get("task_id")):
+        raise RuntimeError("Spool kept: completion, export and Globus verification are all required")
+    if (session / "pruned.json").exists(): return {"state": "pruned", "already_pruned": True}
+    chunks = canonical_chunks(data)
+    exported_chunks = canonical_chunks(destination)
+    if {p.name for p in chunks} != {p.name for p in exported_chunks}:
+        raise RuntimeError("Spool kept: local and Linux chunk inventories differ")
+    expected = {entry["path"]: entry["sha256"] for entry in remote.get("files", [])}
+    # Verify ALL Linux inventory and ALL local chunks before deleting anything.
+    for entry in remote.get("files", []):
+        relative = Path(entry["path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError("Unsafe inventory path")
+        if sha256(destination / relative) != entry["sha256"]:
+            raise RuntimeError("Spool kept: Linux inventory checksum mismatch")
+    removed = []
+    for chunk in chunks:
+        if expected.get(chunk.name) != sha256(chunk):
+            raise RuntimeError("Spool kept: local chunk differs from archived inventory")
+        removed.append(chunk)
+        # canonical_chunks already validated a surviving duplicate's contents.
+        if chunk.name.endswith(".csv.gz") and chunk.with_suffix("").exists():
+            removed.append(chunk.with_suffix(""))
+    if not chunks: raise RuntimeError("Spool kept: no validated chunks")
+    for chunk in removed: chunk.unlink()
+    record = {"state": "pruned", "files": [p.name for p in removed],
+              "archive_task": remote["archive"]["task_id"], "verified_at": remote["archive"]["verified_at"]}
+    write_json(session / "pruned.json", record)
+    return record
+
+
 def control(run_id: str, action: str, reason: str = "user_stop") -> dict:
     session = session_path(run_id)
     if action == "recover":
         return recover(run_id)
+    if action == "prune-spool":
+        return prune_spool(run_id)
     if not (session / "spec.json").exists():
         return {"state": "unknown", "reason": "no_local_session"}
     # Independent files avoid a heartbeat overwriting a concurrent stop.

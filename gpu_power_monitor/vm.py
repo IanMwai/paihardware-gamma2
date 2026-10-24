@@ -146,10 +146,11 @@ def start_acquisition(
     cfg: VmConfig, *, run_id: str, operator: str, machine: str, test: bool,
     gpus: str | None, log_path: Path, config_name: str | None = None,
     duration_sec: float | None = None, maximum_sec: float = 87000,
+    nvml_gpus: list[str] | None = None,
 ) -> subprocess.Popen:
     """Launch the Windows-local supervisor, not an unbounded DAQ process."""
     spec = dict(run_id=run_id, operator=operator, machine=machine, test=test, gpus=gpus,
-                duration_sec=duration_sec, maximum_sec=maximum_sec)
+                duration_sec=duration_sec, maximum_sec=maximum_sec, nvml_gpus=nvml_gpus)
     if config_name:
         spec["config"] = vm_config_path(cfg, config_name)
     log_path.parent.mkdir(parents=True, exist_ok=True)

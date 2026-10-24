@@ -154,7 +154,7 @@ def block():
 
 def test_writer_queue_full_fails_instead_of_dropping(tmp_path, monkeypatch):
     entered, release=threading.Event(),threading.Event()
-    writer=ChunkWriter(tmp_path,'test',10,dt.datetime.now(),['GPU1'],queue_blocks=1)
+    writer=ChunkWriter(tmp_path,'test',10,dt.datetime.now(),['GPU1'],queue_blocks=1,enqueue_timeout_sec=.01)
     original=writer._write_block_locked
     def delayed(value):
         entered.set(); release.wait(2); original(value)
